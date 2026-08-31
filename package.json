@@ -1,0 +1,16 @@
+{
+  "name": "jastip-worker",
+  "version": "1.0.0",
+  "description": "BMA Jastip Redis Worker",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "redis": "^5.8.2"
+  }
+}
