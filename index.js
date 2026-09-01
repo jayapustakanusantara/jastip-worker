@@ -332,6 +332,30 @@ app.get("/queue/status", async (req, res) => {
 });
 
 
+// Status ringkas untuk dicek dari HP.
+app.get("/status", async (req, res) => {
+  try {
+    const waiting = await redis.lLen(QUEUE_NAME);
+    const processing = await redis.lLen(PROCESSING_QUEUE);
+    const dead = await redis.lLen(DEAD_QUEUE);
+    const pending = waiting + processing;
+
+    return res.json({
+      ok: true,
+      worker: redis.isReady ? "healthy" : "redis-not-ready",
+      redis: redis.isReady ? "connected" : "disconnected",
+      queuePending: pending,
+      waiting,
+      processing,
+      dead,
+      state: pending === 0 ? "IDLE - queue empty" : "BUSY"
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+
 /*
   WORKER
 
@@ -378,6 +402,10 @@ async function worker() {
 
         continue;
       }
+
+      const queueWaitingNow = await redis.lLen(QUEUE_NAME);
+      const queueProcessingNow = await redis.lLen(PROCESSING_QUEUE);
+      console.log(`QUEUE: ${queueWaitingNow + queueProcessingNow} (waiting ${queueWaitingNow}, processing ${queueProcessingNow})`);
 
       console.log("");
       console.log("================================");
@@ -612,10 +640,64 @@ function validateOrderJob(job) {
     };
   }
 
+  // Harga wajib ada di quoted product. FREE dianggap valid untuk giveaway.
+  // ISBN 10/13 digit tidak boleh salah terbaca sebagai harga.
+  const price = extractLikelyPrice(quoted);
+
+  if (!price) {
+    return {
+      ok: false,
+      reason: "NO PRICE"
+    };
+  }
+
   return {
     ok: true,
-    title
+    title,
+    price
   };
+}
+
+
+/*
+  Cari harga di caption/text produk. Format valid antara lain:
+  - 185.000 / 180000 / Rp 185.000
+  - 120 rb / 120rb / 185k
+  - FREE (giveaway)
+
+  Angka ISBN 10/13 digit sengaja ditolak sebagai harga.
+*/
+function extractLikelyPrice(text) {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+    if (/\bFREE\b/i.test(line)) {
+      return "FREE";
+    }
+
+    // Format dengan Rp / rb / ribu / k
+    const tagged = line.match(/(?:\bRp\.?\s*)?(\d{1,3}(?:[.,]\d{3})+|\d{2,6})\s*(rb|ribu|k)?\b/i);
+    if (tagged) {
+      const digits = String(tagged[1] || "").replace(/\D/g, "");
+      const suffix = String(tagged[2] || "").toLowerCase();
+      const hasRp = /\bRp\.?/i.test(line);
+
+      // Jangan pernah menganggap ISBN sebagai harga.
+      if (digits.length === 10 || digits.length === 13) {
+        continue;
+      }
+
+      // Tanpa Rp/suffix, terima angka nominal wajar 4-7 digit atau angka bertitik/koma ribuan.
+      if (hasRp || suffix || /[.,]/.test(tagged[1]) || (digits.length >= 4 && digits.length <= 7)) {
+        return tagged[0].trim();
+      }
+    }
+  }
+
+  return "";
 }
 
 
@@ -680,6 +762,7 @@ function isInvalidProductBridgeError(err) {
   return (
     msg.includes("NO PRODUCT") ||
     msg.includes("NO TITLE") ||
+    msg.includes("NO PRICE") ||
     msg.includes("TITLE TOO SHORT") ||
     msg.includes("PRODUCT")
   );
