@@ -9,6 +9,10 @@ const REDIS_URL = process.env.REDIS_URL;
 const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
 const WORKER_SECRET = process.env.WORKER_SECRET;
 
+// Tambahan untuk reaction ❌ langsung dari Railway worker ke Evolution API
+const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL;
+const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY;
+
 const QUEUE_NAME = "jastip:queue";
 const PROCESSING_QUEUE = "jastip:processing";
 const DEAD_QUEUE = "jastip:dead";
@@ -37,7 +41,8 @@ app.get("/", (req, res) => {
     service: "jastip-worker",
     redis: redis.isReady,
     appsScriptConfigured: Boolean(APPS_SCRIPT_URL),
-    workerSecretConfigured: Boolean(WORKER_SECRET)
+    workerSecretConfigured: Boolean(WORKER_SECRET),
+    evolutionConfigured: Boolean(EVOLUTION_API_URL && EVOLUTION_API_KEY)
   });
 });
 
@@ -52,14 +57,12 @@ app.get("/health", (req, res) => {
   ENDPOINT WEBHOOK EVOLUTION
 
   Evolution akan POST payload messages.upsert ke "/"
-  Jadi sekarang root "/" bisa menerima GET health check
-  dan POST webhook WhatsApp.
+  Root "/" bisa menerima GET health check dan POST webhook WhatsApp.
 */
 app.post("/", async (req, res) => {
   try {
     const body = req.body || {};
 
-    // Evolution biasanya kirim event seperti messages.upsert
     const event =
       body.event ||
       body.type ||
@@ -85,7 +88,6 @@ app.post("/", async (req, res) => {
 
     let data = body.data || body;
 
-    // Beberapa format Evolution bisa membungkus record dalam array
     if (Array.isArray(data)) {
       data = data[0];
     }
@@ -151,19 +153,7 @@ app.post("/", async (req, res) => {
       });
     }
 
-    /*
-      Hanya terima FIX / MAU.
-
-      Contoh valid:
-      FIX
-      FIX 2
-      FIX +1
-      FIX +2
-      FIX NAMI
-      FIX NAMI +2
-      MAU
-      MAU +3
-    */
+    // Hanya FIX / MAU
     if (!/^\s*(FIX|MAU)\b/i.test(text)) {
       return res.status(200).json({
         ok: true,
@@ -174,15 +164,6 @@ app.post("/", async (req, res) => {
 
     const quotedProduct = extractQuotedProduct(message, data.contextInfo);
     const mentionJid = extractMentionJid(message, data.contextInfo);
-
-    /*
-      Kita TIDAK tolak jika quotedProduct kosong di webhook.
-      Job tetap masuk Redis.
-
-      Nanti worker order yang menentukan valid / invalid.
-      Ini penting supaya webhook tetap super ringan
-      dan pesan tidak hilang hanya karena format payload berubah.
-    */
 
     const senderPhone = cleanPhone(
       participantAlt || participant
@@ -250,7 +231,7 @@ app.post("/", async (req, res) => {
 
     /*
       RETURN CEPAT KE EVOLUTION.
-      Jangan proses Google Sheet / reaction di sini.
+      Jangan proses Google Sheet / reaction di webhook.
     */
     return res.status(200).json({
       ok: true,
@@ -268,9 +249,9 @@ app.post("/", async (req, res) => {
   }
 });
 
+
 /*
   Endpoint manual untuk test queue.
-  Bisa kita pakai nanti dari Postman/browser tool.
 */
 app.post("/queue", async (req, res) => {
   try {
@@ -328,15 +309,18 @@ app.post("/queue", async (req, res) => {
   }
 });
 
+
 app.get("/queue/status", async (req, res) => {
   try {
     const waiting = await redis.lLen(QUEUE_NAME);
     const processing = await redis.lLen(PROCESSING_QUEUE);
+    const dead = await redis.lLen(DEAD_QUEUE);
 
     return res.json({
       ok: true,
       waiting,
-      processing
+      processing,
+      dead
     });
 
   } catch (err) {
@@ -347,19 +331,17 @@ app.get("/queue/status", async (req, res) => {
   }
 });
 
+
 /*
-  WORKER FINAL BRIDGE
+  WORKER
 
   Redis queue
   -> ambil job
-  -> POST ke Apps Script
-  -> Apps Script append ke Google QUEUE
-  -> hanya setelah Apps Script mengakui QUEUED / ALREADY QUEUED,
-     job dihapus dari processing.
+  -> VALIDASI DULU DI RAILWAY
+  -> invalid = reaction ❌, selesai, TIDAK ke Apps Script, TIDAK retry
+  -> valid = baru POST ke Apps Script
 
-  Jika Apps Script sementara gagal:
-  -> job dikembalikan ke Redis waiting queue
-  -> tidak hilang diam-diam.
+  Error teknis Apps Script masih boleh retry.
 */
 async function worker() {
   console.log("Worker started...");
@@ -409,6 +391,64 @@ async function worker() {
       console.log("================================");
       console.log("");
 
+      /*
+        VALIDASI CEPAT DI RAILWAY.
+
+        Aturan:
+        1. Tidak reply / quoted kosong -> ❌
+        2. Reply gambar tapi caption/judul kosong -> ❌
+        3. Tidak ditemukan baris judul -> ❌
+        4. Judul < 5 huruf/angka -> ❌
+
+        Semua invalid langsung selesai.
+        Tidak dikirim ke Apps Script.
+        Tidak di-requeue.
+      */
+      const validation = validateOrderJob(job);
+
+      if (!validation.ok) {
+        console.log(
+          "INVALID ORDER:",
+          job.messageId,
+          "|",
+          validation.reason
+        );
+
+        try {
+          await sendReaction(job, "❌");
+
+          console.log(
+            "INVALID REACTION SENT:",
+            job.messageId,
+            "| ❌"
+          );
+        } catch (reactionError) {
+          /*
+            Reaction invalid gagal TIDAK BOLEH membuat order invalid
+            berputar-putar lagi di Redis.
+          */
+          console.error(
+            "INVALID REACTION ERROR:",
+            job.messageId,
+            "|",
+            reactionError.message
+          );
+        }
+
+        await redis.lRem(
+          PROCESSING_QUEUE,
+          1,
+          rawJob
+        );
+
+        console.log(
+          "INVALID DONE - NO RETRY:",
+          job.messageId
+        );
+
+        continue;
+      }
+
       try {
         const result = await sendJobToAppsScript(job);
 
@@ -433,6 +473,47 @@ async function worker() {
           bridgeError.message
         );
 
+        /*
+          Pengaman tambahan:
+          kalau Apps Script tetap mengembalikan error PRODUCT/TITLE,
+          anggap invalid, beri ❌, lalu selesai.
+          JANGAN requeue.
+        */
+        if (isInvalidProductBridgeError(bridgeError)) {
+          try {
+            await sendReaction(job, "❌");
+
+            console.log(
+              "BRIDGE INVALID REACTION SENT:",
+              job.messageId,
+              "| ❌"
+            );
+          } catch (reactionError) {
+            console.error(
+              "BRIDGE INVALID REACTION ERROR:",
+              job.messageId,
+              "|",
+              reactionError.message
+            );
+          }
+
+          await redis.lRem(
+            PROCESSING_QUEUE,
+            1,
+            rawJob
+          );
+
+          console.log(
+            "BRIDGE INVALID DONE - NO RETRY:",
+            job.messageId
+          );
+
+          continue;
+        }
+
+        /*
+          Hanya error teknis sungguhan yang retry.
+        */
         const retryCount =
           Number(job.bridgeRetry || 0) + 1;
 
@@ -449,12 +530,6 @@ async function worker() {
           rawJob
         );
 
-        /*
-          Jangan buang order.
-          Sampai 20 kali retry tetap dikembalikan ke waiting queue.
-          Setelah itu masuk dead queue supaya tidak hot-loop tanpa akhir,
-          tetapi datanya tetap tersimpan di Redis untuk recovery manual.
-        */
         if (retryCount <= 20) {
           await redis.rPush(
             QUEUE_NAME,
@@ -492,6 +567,128 @@ async function worker() {
   }
 }
 
+
+/*
+  VALIDASI AWAL ORDER
+*/
+function validateOrderJob(job) {
+  const quoted = String(
+    job.quotedProduct ||
+    job.quotedText ||
+    ""
+  ).trim();
+
+  if (!quoted) {
+    return {
+      ok: false,
+      reason: "NO QUOTED PRODUCT"
+    };
+  }
+
+  const title = extractLikelyTitle(quoted);
+
+  if (!title) {
+    return {
+      ok: false,
+      reason: "NO TITLE"
+    };
+  }
+
+  /*
+    Hitung huruf/angka saja.
+    Spasi, emoji dan simbol tidak ikut dihitung.
+    Contoh:
+      "ABC" = 3 -> ❌
+      "Book" = 4 -> ❌
+      "Dog Man" = 6 -> valid
+  */
+  const comparable = title
+    .replace(/[^\p{L}\p{N}]/gu, "");
+
+  if (comparable.length < 5) {
+    return {
+      ok: false,
+      reason: `TITLE TOO SHORT: "${title}"`
+    };
+  }
+
+  return {
+    ok: true,
+    title
+  };
+}
+
+
+/*
+  Ambil kandidat judul dari quoted caption/text.
+
+  Lewati:
+  - FIX / MAU
+  - ISBN 10 atau 13 digit
+  - baris harga murni
+
+  Ambil baris teks pertama yang terlihat seperti judul.
+*/
+function extractLikelyTitle(text) {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+    if (/^\s*(FIX|MAU)\b/i.test(line)) {
+      continue;
+    }
+
+    const compactDigits = line.replace(/\D/g, "");
+
+    if (
+      compactDigits.length === 10 ||
+      compactDigits.length === 13
+    ) {
+      continue;
+    }
+
+    if (
+      /^(rp\.?\s*)?[\d.,]+\s*(k|rb|ribu)?$/i.test(line)
+    ) {
+      continue;
+    }
+
+    const meaningful = line.replace(/[^\p{L}\p{N}]/gu, "");
+
+    if (meaningful.length > 0) {
+      return line;
+    }
+  }
+
+  return "";
+}
+
+
+/*
+  Kalau Apps Script menjawab PRODUCT/TITLE invalid,
+  jangan anggap ini error teknis.
+*/
+function isInvalidProductBridgeError(err) {
+  const msg = String(
+    err?.message ||
+    err ||
+    ""
+  ).toUpperCase();
+
+  return (
+    msg.includes("NO PRODUCT") ||
+    msg.includes("NO TITLE") ||
+    msg.includes("TITLE TOO SHORT") ||
+    msg.includes("PRODUCT")
+  );
+}
+
+
+/*
+  Kirim job valid ke Apps Script
+*/
 async function sendJobToAppsScript(job) {
   if (!APPS_SCRIPT_URL) {
     throw new Error("APPS_SCRIPT_URL is missing");
@@ -600,6 +797,94 @@ async function sendJobToAppsScript(job) {
 }
 
 
+/*
+  Kirim reaction langsung dari Railway worker ke Evolution API.
+*/
+async function sendReaction(job, emoji) {
+  if (!EVOLUTION_API_URL) {
+    throw new Error("EVOLUTION_API_URL is missing");
+  }
+
+  if (!EVOLUTION_API_KEY) {
+    throw new Error("EVOLUTION_API_KEY is missing");
+  }
+
+  const instance = String(
+    job.instance ||
+    "Jastip-bot"
+  );
+
+  const baseUrl = String(EVOLUTION_API_URL)
+    .replace(/\/+$/, "");
+
+  const endpoint =
+    `${baseUrl}/message/sendReaction/${encodeURIComponent(instance)}`;
+
+  const reactionKey = {
+    remoteJid: String(job.groupId || ""),
+    fromMe: false,
+    id: String(job.messageId || "")
+  };
+
+  const participant = String(
+    job.participant ||
+    job.rawKey?.participant ||
+    ""
+  );
+
+  if (participant) {
+    reactionKey.participant = participant;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    10000
+  );
+
+  try {
+    const response = await fetch(
+      endpoint,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          apikey: EVOLUTION_API_KEY
+        },
+        body: JSON.stringify({
+          key: reactionKey,
+          reaction: emoji
+        }),
+        signal: controller.signal
+      }
+    );
+
+    const responseText =
+      (await response.text()).trim();
+
+    if (!response.ok) {
+      throw new Error(
+        `Evolution reaction HTTP ${response.status}: ${responseText}`
+      );
+    }
+
+    return responseText;
+
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      throw new Error(
+        "Evolution reaction timeout after 10s"
+      );
+    }
+
+    throw err;
+
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+
 function extractMessageText(message) {
   if (!message || typeof message !== "object") {
     return "";
@@ -636,17 +921,9 @@ function extractMessageText(message) {
   return "";
 }
 
+
 function extractQuotedProduct(message, dataContextInfo) {
   try {
-    /*
-      Evolution v2 bisa menaruh contextInfo reply di dua tempat:
-
-      1. data.contextInfo.quotedMessage
-         -> ini format payload Jastip-bot yang kita lihat langsung.
-
-      2. data.message.<messageType>.contextInfo.quotedMessage
-         -> tetap didukung sebagai fallback.
-    */
     const nestedCtx =
       message?.extendedTextMessage?.contextInfo ||
       message?.imageMessage?.contextInfo ||
@@ -703,6 +980,7 @@ function extractQuotedProduct(message, dataContextInfo) {
   }
 }
 
+
 function extractMentionJid(message, dataContextInfo) {
   try {
     const topCtx =
@@ -746,11 +1024,13 @@ function cleanPhone(jid) {
     .replace(/\D/g, "");
 }
 
+
 function sleep(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
 }
+
 
 async function start() {
   if (!REDIS_URL) {
@@ -783,6 +1063,7 @@ async function start() {
     process.exit(1);
   });
 }
+
 
 start().catch((err) => {
   console.error("START ERROR:", err);
