@@ -6,14 +6,17 @@ app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 8080;
 const REDIS_URL = process.env.REDIS_URL;
+const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
+const WORKER_SECRET = process.env.WORKER_SECRET;
 
 const QUEUE_NAME = "jastip:queue";
 const PROCESSING_QUEUE = "jastip:processing";
+const DEAD_QUEUE = "jastip:dead";
 
 const SUPPORTED_GROUPS = new Set([
   "120363214326633370@g.us", // ORDER
   "120363427983824748@g.us", // ORDER LIVE
-  "120363045287815681@g.us"  // ORDER BBW
+  "120363414084709085@g.us"  // ORDER BBW
 ]);
 
 const redis = createClient({
@@ -32,7 +35,9 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     service: "jastip-worker",
-    redis: redis.isReady
+    redis: redis.isReady,
+    appsScriptConfigured: Boolean(APPS_SCRIPT_URL),
+    workerSecretConfigured: Boolean(WORKER_SECRET)
   });
 });
 
@@ -168,6 +173,7 @@ app.post("/", async (req, res) => {
     }
 
     const quotedProduct = extractQuotedProduct(message, data.contextInfo);
+    const mentionJid = extractMentionJid(message, data.contextInfo);
 
     /*
       Kita TIDAK tolak jika quotedProduct kosong di webhook.
@@ -198,6 +204,7 @@ app.post("/", async (req, res) => {
 
       text,
       quotedProduct,
+      mentionJid,
 
       rawKey: key
     };
@@ -341,19 +348,18 @@ app.get("/queue/status", async (req, res) => {
 });
 
 /*
-  WORKER TEST MODE
+  WORKER FINAL BRIDGE
 
-  Untuk saat ini worker hanya:
   Redis queue
   -> ambil job
-  -> print ke log
-  -> tandai selesai
+  -> POST ke Apps Script
+  -> Apps Script append ke Google QUEUE
+  -> hanya setelah Apps Script mengakui QUEUED / ALREADY QUEUED,
+     job dihapus dari processing.
 
-  BELUM:
-  - masuk Google Sheet
-  - kirim reaction ✅
-
-  Kita pastikan webhook Redis stabil dulu.
+  Jika Apps Script sementara gagal:
+  -> job dikembalikan ke Redis waiting queue
+  -> tidak hilang diam-diam.
 */
 async function worker() {
   console.log("Worker started...");
@@ -383,6 +389,11 @@ async function worker() {
           rawJob
         );
 
+        await redis.lPush(
+          DEAD_QUEUE,
+          rawJob
+        );
+
         continue;
       }
 
@@ -398,22 +409,81 @@ async function worker() {
       console.log("================================");
       console.log("");
 
-      /*
-        TEST MODE DONE.
-        Nanti bagian ini kita ganti dengan:
-        parse FIX
-        -> ORDER
-        -> Google Sheets
-        -> reaction ✅
-      */
+      try {
+        const result = await sendJobToAppsScript(job);
 
-      await redis.lRem(
-        PROCESSING_QUEUE,
-        1,
-        rawJob
-      );
+        await redis.lRem(
+          PROCESSING_QUEUE,
+          1,
+          rawJob
+        );
 
-      console.log("DONE TEST:", job.messageId);
+        console.log(
+          "SHEET ACCEPTED:",
+          job.messageId,
+          "|",
+          result
+        );
+
+      } catch (bridgeError) {
+        console.error(
+          "SHEET BRIDGE ERROR:",
+          job.messageId,
+          "|",
+          bridgeError.message
+        );
+
+        const retryCount =
+          Number(job.bridgeRetry || 0) + 1;
+
+        const retryJob = {
+          ...job,
+          bridgeRetry: retryCount,
+          lastBridgeError: bridgeError.message,
+          lastBridgeRetryAt: new Date().toISOString()
+        };
+
+        await redis.lRem(
+          PROCESSING_QUEUE,
+          1,
+          rawJob
+        );
+
+        /*
+          Jangan buang order.
+          Sampai 20 kali retry tetap dikembalikan ke waiting queue.
+          Setelah itu masuk dead queue supaya tidak hot-loop tanpa akhir,
+          tetapi datanya tetap tersimpan di Redis untuk recovery manual.
+        */
+        if (retryCount <= 20) {
+          await redis.rPush(
+            QUEUE_NAME,
+            JSON.stringify(retryJob)
+          );
+
+          console.log(
+            "REQUEUED:",
+            job.messageId,
+            "| retry",
+            retryCount
+          );
+
+          await sleep(
+            Math.min(30000, 1500 * retryCount)
+          );
+
+        } else {
+          await redis.lPush(
+            DEAD_QUEUE,
+            JSON.stringify(retryJob)
+          );
+
+          console.error(
+            "MOVED TO DEAD QUEUE:",
+            job.messageId
+          );
+        }
+      }
 
     } catch (err) {
       console.error("WORKER ERROR:", err);
@@ -421,6 +491,114 @@ async function worker() {
     }
   }
 }
+
+async function sendJobToAppsScript(job) {
+  if (!APPS_SCRIPT_URL) {
+    throw new Error("APPS_SCRIPT_URL is missing");
+  }
+
+  if (!WORKER_SECRET) {
+    throw new Error("WORKER_SECRET is missing");
+  }
+
+  const payload = {
+    source: "railway-worker",
+    workerSecret: WORKER_SECRET,
+    job: {
+      receivedAt:
+        job.receivedAt ||
+        job.queuedAt ||
+        new Date().toISOString(),
+
+      messageId: String(job.messageId || ""),
+      instance: String(job.instance || "Jastip-bot"),
+      groupId: String(job.groupId || ""),
+
+      senderLid: String(
+        job.participant ||
+        job.senderLid ||
+        ""
+      ),
+
+      senderPhoneRaw: String(
+        job.participantAlt ||
+        job.senderPhoneRaw ||
+        job.senderPhone ||
+        ""
+      ),
+
+      pushName: String(job.pushName || ""),
+      text: String(job.text || ""),
+
+      quotedText: String(
+        job.quotedProduct ||
+        job.quotedText ||
+        ""
+      ),
+
+      mentionJid: String(
+        job.mentionJid ||
+        ""
+      )
+    }
+  };
+
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    20000
+  );
+
+  try {
+    const response = await fetch(
+      APPS_SCRIPT_URL,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify(payload),
+        redirect: "follow",
+        signal: controller.signal
+      }
+    );
+
+    const bodyText =
+      (await response.text()).trim();
+
+    if (!response.ok) {
+      throw new Error(
+        `Apps Script HTTP ${response.status}: ${bodyText}`
+      );
+    }
+
+    const accepted = new Set([
+      "QUEUED",
+      "ALREADY QUEUED"
+    ]);
+
+    if (!accepted.has(bodyText)) {
+      throw new Error(
+        `Apps Script rejected job: ${bodyText || "(empty response)"}`
+      );
+    }
+
+    return bodyText;
+
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      throw new Error(
+        "Apps Script timeout after 20s"
+      );
+    }
+
+    throw err;
+
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 
 function extractMessageText(message) {
   if (!message || typeof message !== "object") {
@@ -524,6 +702,38 @@ function extractQuotedProduct(message, dataContextInfo) {
     return "";
   }
 }
+
+function extractMentionJid(message, dataContextInfo) {
+  try {
+    const topCtx =
+      dataContextInfo &&
+      typeof dataContextInfo === "object"
+        ? dataContextInfo
+        : {};
+
+    const nestedCtx =
+      message?.extendedTextMessage?.contextInfo ||
+      message?.imageMessage?.contextInfo ||
+      message?.videoMessage?.contextInfo ||
+      message?.documentMessage?.contextInfo ||
+      {};
+
+    const mentioned =
+      topCtx.mentionedJid ||
+      nestedCtx.mentionedJid ||
+      [];
+
+    if (!Array.isArray(mentioned) || !mentioned.length) {
+      return "";
+    }
+
+    return String(mentioned[0] || "").trim();
+
+  } catch (err) {
+    return "";
+  }
+}
+
 
 function cleanPhone(jid) {
   if (!jid) {
