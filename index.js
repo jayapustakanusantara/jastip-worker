@@ -54,6 +54,38 @@ app.post("/", async (req, res) => {
   try {
     const body = req.body || {};
 
+    // =========================================================
+    // TEMP DIAGNOSTIC LOG
+    // Setiap POST dari Evolution dibuat terlihat di Railway.
+    // =========================================================
+    console.log("");
+    console.log("######## WEBHOOK HIT ########");
+    console.log("Time:", new Date().toISOString());
+    console.log("Method:", req.method);
+    console.log("Path:", req.path);
+    console.log("Content-Type:", req.headers["content-type"] || "");
+    console.log("Body keys:", Object.keys(body));
+    console.log(
+      "Event raw:",
+      body.event || body.type || body.eventType || "(kosong)"
+    );
+    console.log(
+      "Instance raw:",
+      body.instance || body.instanceName || body.sender || "(kosong)"
+    );
+
+    try {
+      console.log(
+        "Payload preview:",
+        JSON.stringify(body).slice(0, 6000)
+      );
+    } catch (previewErr) {
+      console.log("Payload preview gagal:", previewErr.message);
+    }
+
+    console.log("#############################");
+    console.log("");
+
     // Evolution biasanya kirim event seperti messages.upsert
     const event =
       body.event ||
@@ -65,6 +97,7 @@ app.post("/", async (req, res) => {
       String(event).toLowerCase() !== "messages.upsert" &&
       String(event).toLowerCase() !== "messages_upsert"
     ) {
+      console.log("IGNORED: not messages.upsert | event =", event);
       return res.status(200).json({
         ok: true,
         ignored: true,
@@ -96,6 +129,7 @@ app.post("/", async (req, res) => {
       "";
 
     if (!SUPPORTED_GROUPS.has(remoteJid)) {
+      console.log("IGNORED: unsupported group | remoteJid =", remoteJid);
       return res.status(200).json({
         ok: true,
         ignored: true,
@@ -110,6 +144,7 @@ app.post("/", async (req, res) => {
       "";
 
     if (!messageId) {
+      console.log("IGNORED: missing messageId");
       return res.status(200).json({
         ok: true,
         ignored: true,
@@ -139,6 +174,7 @@ app.post("/", async (req, res) => {
     const text = extractMessageText(message);
 
     if (!text) {
+      console.log("IGNORED: no text | messageId =", messageId);
       return res.status(200).json({
         ok: true,
         ignored: true,
@@ -160,6 +196,7 @@ app.post("/", async (req, res) => {
       MAU +3
     */
     if (!/^\s*(FIX|MAU)\b/i.test(text)) {
+      console.log("IGNORED: not FIX/MAU | text =", text);
       return res.status(200).json({
         ok: true,
         ignored: true,
