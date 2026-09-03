@@ -1,3 +1,4 @@
+// JASTIP WORKER V3 - QUEUE RECOVERY + MESSAGE DELETE CANCEL
 const express = require("express");
 const { createClient } = require("redis");
 
@@ -16,6 +17,7 @@ const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY;
 const QUEUE_NAME = "jastip:queue";
 const PROCESSING_QUEUE = "jastip:processing";
 const DEAD_QUEUE = "jastip:dead";
+const BBW_GROUP_ID = "120363414084709085@g.us";
 
 const SUPPORTED_GROUPS = new Set([
   "120363214326633370@g.us", // ORDER
@@ -69,14 +71,22 @@ app.post("/", async (req, res) => {
       body.eventType ||
       "";
 
-    if (
-      String(event).toLowerCase() !== "messages.upsert" &&
-      String(event).toLowerCase() !== "messages_upsert"
-    ) {
+    const normalizedEvent =
+      String(event)
+        .toLowerCase()
+        .replace(/_/g, ".");
+
+    const isOrderEvent =
+      normalizedEvent === "messages.upsert";
+
+    const isDeleteEvent =
+      normalizedEvent === "messages.delete";
+
+    if (!isOrderEvent && !isDeleteEvent) {
       return res.status(200).json({
         ok: true,
         ignored: true,
-        reason: "not messages.upsert"
+        reason: "not messages.upsert/delete"
       });
     }
 
@@ -138,6 +148,79 @@ app.post("/", async (req, res) => {
       data.pushName ||
       data.notifyName ||
       "";
+
+    /*
+      Customer menghapus pesan FIX/MAU.
+      Tidak semua pesan yang dihapus adalah order, jadi Apps Script nanti
+      hanya menghapus bila Message ID memang ditemukan di tab ORDER.
+    */
+    if (isDeleteEvent) {
+      // Fitur batal karena Delete for Everyone hanya berlaku di grup BBW.
+      if (remoteJid !== BBW_GROUP_ID) {
+        return res.status(200).json({
+          ok: true,
+          ignored: true,
+          reason: "message delete cancellation is BBW only",
+          remoteJid,
+          messageId
+        });
+      }
+
+      const deleteSeenKey =
+        `jastip:delete-seen:${messageId}`;
+
+      const firstDelete = await redis.set(
+        deleteSeenKey,
+        "1",
+        {
+          NX: true,
+          EX: 60 * 60 * 24 * 7
+        }
+      );
+
+      if (!firstDelete) {
+        return res.status(200).json({
+          ok: true,
+          duplicate: true,
+          action: "CANCEL_DELETED_MESSAGE",
+          messageId
+        });
+      }
+
+      const cancelJob = {
+        action: "CANCEL_DELETED_MESSAGE",
+        receivedAt: new Date().toISOString(),
+        instance,
+        messageId,
+        groupId: remoteJid,
+        participant,
+        participantAlt,
+        senderPhone: cleanPhone(
+          participantAlt || participant
+        ),
+        pushName,
+        rawKey: key
+      };
+
+      await redis.lPush(
+        QUEUE_NAME,
+        JSON.stringify(cancelJob)
+      );
+
+      console.log(
+        "DELETE QUEUED:",
+        messageId,
+        "|",
+        remoteJid
+      );
+
+      return res.status(200).json({
+        ok: true,
+        queued: true,
+        action: "CANCEL_DELETED_MESSAGE",
+        messageId
+      });
+    }
 
     const message =
       data.message ||
@@ -432,7 +515,13 @@ async function worker() {
         Tidak dikirim ke Apps Script.
         Tidak di-requeue.
       */
-      const validation = validateOrderJob(job);
+      const isCancellation =
+        job.action === "CANCEL_DELETED_MESSAGE";
+
+      const validation =
+        isCancellation
+          ? { ok: true }
+          : validateOrderJob(job);
 
       if (!validation.ok) {
         console.log(
@@ -781,10 +870,16 @@ async function sendJobToAppsScript(job) {
     throw new Error("WORKER_SECRET is missing");
   }
 
+  const isCancellation =
+    job.action === "CANCEL_DELETED_MESSAGE";
+
   const payload = {
-    source: "railway-worker",
+    source: isCancellation
+      ? "railway-worker-delete"
+      : "railway-worker",
     workerSecret: WORKER_SECRET,
     job: {
+      action: String(job.action || ""),
       receivedAt:
         job.receivedAt ||
         job.queuedAt ||
@@ -854,7 +949,10 @@ async function sendJobToAppsScript(job) {
 
     const accepted = new Set([
       "QUEUED",
-      "ALREADY QUEUED"
+      "ALREADY QUEUED",
+      "CANCELLED",
+      "ALREADY CANCELLED",
+      "PROTECTED"
     ]);
 
     if (!accepted.has(bodyText)) {
