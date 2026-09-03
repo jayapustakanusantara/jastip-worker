@@ -1115,6 +1115,49 @@ function sleep(ms) {
 }
 
 
+/*
+  RECOVERY SETELAH WORKER RESTART
+
+  BRPOPLPUSH memindahkan job ke jastip:processing sebelum diproses.
+  Kalau Railway restart di tengah proses, job bisa tertinggal di sana.
+  Saat startup, kembalikan semuanya ke queue agar tidak macet selamanya.
+
+  Apps Script tetap menjadi pengaman duplikat: bila job sebelumnya sudah
+  diterima, jawabannya ALREADY QUEUED dan worker akan menyelesaikannya.
+*/
+async function recoverStuckProcessingJobs() {
+  const stuckCount = await redis.lLen(PROCESSING_QUEUE);
+
+  if (stuckCount === 0) {
+    console.log("RECOVERY: no stuck processing jobs");
+    return;
+  }
+
+  console.warn(
+    `RECOVERY: moving ${stuckCount} stuck processing job(s) back to queue`
+  );
+
+  let recovered = 0;
+
+  while (true) {
+    const movedJob = await redis.rPopLPush(
+      PROCESSING_QUEUE,
+      QUEUE_NAME
+    );
+
+    if (!movedJob) {
+      break;
+    }
+
+    recovered += 1;
+  }
+
+  console.log(
+    `RECOVERY DONE: ${recovered} job(s) returned to queue`
+  );
+}
+
+
 async function start() {
   if (!REDIS_URL) {
     console.error("REDIS_URL IS MISSING");
@@ -1126,6 +1169,8 @@ async function start() {
   await redis.connect();
 
   console.log("Redis connected.");
+
+  await recoverStuckProcessingJobs();
 
   app.listen(
     PORT,
