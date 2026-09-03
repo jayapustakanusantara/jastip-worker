@@ -1,4 +1,4 @@
-// JASTIP WORKER V3 - QUEUE RECOVERY + MESSAGE DELETE CANCEL
+// JASTIP WORKER V3.2 - DELETE/UPDATE REVOKE + QUEUE RECOVERY
 const express = require("express");
 const { createClient } = require("redis");
 
@@ -82,11 +82,14 @@ app.post("/", async (req, res) => {
     const isDeleteEvent =
       normalizedEvent === "messages.delete";
 
-    if (!isOrderEvent && !isDeleteEvent) {
+    const isUpdateEvent =
+      normalizedEvent === "messages.update";
+
+    if (!isOrderEvent && !isDeleteEvent && !isUpdateEvent) {
       return res.status(200).json({
         ok: true,
         ignored: true,
-        reason: "not messages.upsert/delete"
+        reason: "not messages.upsert/delete/update"
       });
     }
 
@@ -149,12 +152,58 @@ app.post("/", async (req, res) => {
       data.notifyName ||
       "";
 
+    const updateStatus =
+      String(
+        data.status ||
+        data.update?.status ||
+        data.messageStatus ||
+        ""
+      ).toUpperCase();
+
+    const protocolType =
+      String(
+        data.message?.protocolMessage?.type ??
+        data.update?.message?.protocolMessage?.type ??
+        ""
+      ).toUpperCase();
+
+    const updateExplicitlyRemovedMessage =
+      Boolean(
+        data.update &&
+        Object.prototype.hasOwnProperty.call(
+          data.update,
+          "message"
+        ) &&
+        data.update.message === null
+      );
+
+    const isDeletedUpdate =
+      isUpdateEvent &&
+      (
+        updateStatus.includes("DELETE") ||
+        updateStatus.includes("REVOKE") ||
+        protocolType === "REVOKE" ||
+        protocolType === "MESSAGE_REVOKE" ||
+        protocolType === "0" ||
+        updateExplicitlyRemovedMessage
+      );
+
+    // Read/delivered/played update bukan pembatalan dan harus diabaikan.
+    if (isUpdateEvent && !isDeletedUpdate) {
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+        reason: "messages.update is not delete/revoke",
+        messageId
+      });
+    }
+
     /*
       Customer menghapus pesan FIX/MAU.
       Tidak semua pesan yang dihapus adalah order, jadi Apps Script nanti
       hanya menghapus bila Message ID memang ditemukan di tab ORDER.
     */
-    if (isDeleteEvent) {
+    if (isDeleteEvent || isDeletedUpdate) {
       // Fitur batal karena Delete for Everyone hanya berlaku di grup BBW.
       if (remoteJid !== BBW_GROUP_ID) {
         return res.status(200).json({
