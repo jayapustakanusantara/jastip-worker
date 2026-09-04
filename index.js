@@ -1,4 +1,4 @@
-// JASTIP WORKER V3.2 - DELETE/UPDATE REVOKE + QUEUE RECOVERY
+// JASTIP WORKER V3.3 - ROBUST DELETE/UPDATE REVOKE + QUEUE RECOVERY
 const express = require("express");
 const { createClient } = require("redis");
 
@@ -74,7 +74,8 @@ app.post("/", async (req, res) => {
     const normalizedEvent =
       String(event)
         .toLowerCase()
-        .replace(/_/g, ".");
+        .trim()
+        .replace(/[-_]/g, ".");
 
     const isOrderEvent =
       normalizedEvent === "messages.upsert";
@@ -105,52 +106,40 @@ app.post("/", async (req, res) => {
       data = data[0];
     }
 
-    const key =
+    data = data || {};
+
+    /*
+      Evolution/Baileys dapat mengirim key pesan yang dihapus dalam
+      beberapa bentuk:
+
+      1. data.key
+      2. data.keys[0]
+      3. data.message.protocolMessage.key
+      4. data.update.message.protocolMessage.key
+
+      Untuk REVOKE, protocolMessage.key adalah referensi ke pesan FIX/MAU
+      yang asli. Karena itu key tersebut harus diprioritaskan.
+    */
+    const outerKey =
       data.key ||
       data.message?.key ||
       {};
 
-    const remoteJid =
-      key.remoteJid ||
-      data.remoteJid ||
-      "";
+    const keysArrayKey =
+      Array.isArray(data.keys) && data.keys.length
+        ? (data.keys[0] || {})
+        : {};
 
-    if (!SUPPORTED_GROUPS.has(remoteJid)) {
-      return res.status(200).json({
-        ok: true,
-        ignored: true,
-        reason: "unsupported group",
-        remoteJid
-      });
-    }
+    const protocolMessage =
+      data.message?.protocolMessage ||
+      data.update?.message?.protocolMessage ||
+      data.update?.protocolMessage ||
+      data.protocolMessage ||
+      {};
 
-    const messageId =
-      key.id ||
-      data.id ||
-      "";
-
-    if (!messageId) {
-      return res.status(200).json({
-        ok: true,
-        ignored: true,
-        reason: "missing messageId"
-      });
-    }
-
-    const participant =
-      key.participant ||
-      data.participant ||
-      "";
-
-    const participantAlt =
-      key.participantAlt ||
-      data.participantAlt ||
-      "";
-
-    const pushName =
-      data.pushName ||
-      data.notifyName ||
-      "";
+    const protocolKey =
+      protocolMessage.key ||
+      {};
 
     const updateStatus =
       String(
@@ -162,8 +151,7 @@ app.post("/", async (req, res) => {
 
     const protocolType =
       String(
-        data.message?.protocolMessage?.type ??
-        data.update?.message?.protocolMessage?.type ??
+        protocolMessage.type ??
         ""
       ).toUpperCase();
 
@@ -193,17 +181,113 @@ app.post("/", async (req, res) => {
       return res.status(200).json({
         ok: true,
         ignored: true,
-        reason: "messages.update is not delete/revoke",
-        messageId
+        reason: "messages.update is not delete/revoke"
       });
     }
+
+    const isCancellationEvent =
+      isDeleteEvent || isDeletedUpdate;
+
+    const key =
+      isCancellationEvent
+        ? (
+            Object.keys(protocolKey).length
+              ? protocolKey
+              : Object.keys(keysArrayKey).length
+                ? keysArrayKey
+                : outerKey
+          )
+        : outerKey;
+
+    const remoteJid =
+      key.remoteJid ||
+      protocolKey.remoteJid ||
+      keysArrayKey.remoteJid ||
+      outerKey.remoteJid ||
+      data.remoteJid ||
+      "";
+
+    const messageId =
+      key.id ||
+      protocolKey.id ||
+      keysArrayKey.id ||
+      outerKey.id ||
+      data.id ||
+      "";
+
+    if (isCancellationEvent) {
+      console.log(
+        "DELETE EVENT RECEIVED:",
+        normalizedEvent,
+        "| protocol:",
+        protocolType || "-",
+        "| target:",
+        messageId || "MISSING",
+        "| group:",
+        remoteJid || "MISSING"
+      );
+    }
+
+    if (!SUPPORTED_GROUPS.has(remoteJid)) {
+      if (isCancellationEvent) {
+        console.warn(
+          "DELETE IGNORED: unsupported group |",
+          remoteJid || "MISSING",
+          "| target:",
+          messageId || "MISSING"
+        );
+      }
+
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+        reason: "unsupported group",
+        remoteJid
+      });
+    }
+
+    if (!messageId) {
+      if (isCancellationEvent) {
+        console.warn(
+          "DELETE IGNORED: missing target messageId | group:",
+          remoteJid
+        );
+      }
+
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+        reason: "missing messageId"
+      });
+    }
+
+    const participant =
+      key.participant ||
+      protocolKey.participant ||
+      keysArrayKey.participant ||
+      outerKey.participant ||
+      data.participant ||
+      "";
+
+    const participantAlt =
+      key.participantAlt ||
+      protocolKey.participantAlt ||
+      keysArrayKey.participantAlt ||
+      outerKey.participantAlt ||
+      data.participantAlt ||
+      "";
+
+    const pushName =
+      data.pushName ||
+      data.notifyName ||
+      "";
 
     /*
       Customer menghapus pesan FIX/MAU.
       Tidak semua pesan yang dihapus adalah order, jadi Apps Script nanti
       hanya menghapus bila Message ID memang ditemukan di tab ORDER.
     */
-    if (isDeleteEvent || isDeletedUpdate) {
+    if (isCancellationEvent) {
       // Fitur batal karena Delete for Everyone hanya berlaku di grup BBW.
       if (remoteJid !== BBW_GROUP_ID) {
         return res.status(200).json({
@@ -254,6 +338,15 @@ app.post("/", async (req, res) => {
       await redis.lPush(
         QUEUE_NAME,
         JSON.stringify(cancelJob)
+      );
+
+      console.log(
+        "DELETE TARGET RESOLVED:",
+        messageId,
+        "|",
+        remoteJid,
+        "| sender:",
+        cleanPhone(participantAlt || participant) || "unknown"
       );
 
       console.log(
