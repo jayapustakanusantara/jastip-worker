@@ -1,4 +1,4 @@
-// JASTIP WORKER V3.3 - ROBUST DELETE/UPDATE REVOKE + QUEUE RECOVERY
+// JASTIP WORKER V3.4 - V3.3 + EVOLUTION RAILWAY SPIKE MONITOR
 const express = require("express");
 const { createClient } = require("redis");
 
@@ -13,6 +13,28 @@ const WORKER_SECRET = process.env.WORKER_SECRET;
 // Tambahan untuk reaction ❌ langsung dari Railway worker ke Evolution API
 const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL;
 const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY;
+
+
+// =====================================================
+// EVOLUTION / RAILWAY SPIKE MONITOR
+// =====================================================
+const RAILWAY_API_TOKEN = process.env.RAILWAY_API_TOKEN;
+const RAILWAY_PROJECT_ID = process.env.RAILWAY_PROJECT_ID || "17796c36-2457-49b2-91c9-06feb2895f3b";
+const RAILWAY_ENVIRONMENT_ID = process.env.RAILWAY_ENVIRONMENT_ID || "7bdc80f9-323a-4746-aaac-1670754f9bca";
+const RAILWAY_EVOLUTION_SERVICE_ID = process.env.RAILWAY_EVOLUTION_SERVICE_ID || "4400361b-e856-4210-96ff-f475b12c76a6";
+const RAILWAY_GRAPHQL_URL = process.env.RAILWAY_GRAPHQL_URL || "https://backboard.railway.com/graphql/v2";
+const ADMIN_WA_NUMBER = process.env.ADMIN_WA_NUMBER || "6283193967234";
+const SPIKE_INSTANCE = process.env.SPIKE_INSTANCE || "Jastip-bot";
+
+const SPIKE_CHECK_INTERVAL_MS = 60 * 1000; // 1 menit
+const SPIKE_MEMORY_GB = 1.0;
+const SPIKE_CPU_VCPU = 1.5;
+const SPIKE_WARNING_AFTER_MS = 5 * 60 * 1000;
+const SPIKE_CRITICAL_AFTER_MS = 10 * 60 * 1000;
+const SPIKE_RECOVERY_AFTER_MS = 5 * 60 * 1000;
+const SPIKE_STATE_KEY = "jastip:spike:active";
+const SPIKE_HISTORY_KEY = "jastip:spike:history";
+const SPIKE_HISTORY_LIMIT = 20;
 
 const QUEUE_NAME = "jastip:queue";
 const PROCESSING_QUEUE = "jastip:processing";
@@ -577,6 +599,59 @@ app.get("/status", async (req, res) => {
     });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+
+// =====================================================
+// SPIKE LOG - enak dibuka dari HP
+// =====================================================
+app.get("/spike-log", async (req, res) => {
+  try {
+    const activeRaw = await redis.get(SPIKE_STATE_KEY);
+    const historyRaw = await redis.lRange(SPIKE_HISTORY_KEY, 0, SPIKE_HISTORY_LIMIT - 1);
+    const active = activeRaw ? JSON.parse(activeRaw) : null;
+    const history = historyRaw.map((x) => {
+      try { return JSON.parse(x); } catch { return null; }
+    }).filter(Boolean);
+
+    const fmt = (iso) => iso ? formatJakarta(iso) : "-";
+    const line = (label, value) => `<div><b>${escapeHtml(label)}</b>: ${escapeHtml(String(value ?? "-"))}</div>`;
+
+    let html = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Evolution Spike Log</title><style>body{font-family:Arial,sans-serif;max-width:760px;margin:24px auto;padding:0 16px;line-height:1.55}.card{border:1px solid #ddd;border-radius:12px;padding:16px;margin:14px 0}.muted{color:#666}.ok{font-weight:700}.bad{font-weight:700}</style></head><body><h2>Evolution API Spike Monitor</h2>`;
+
+    if (active) {
+      html += `<div class="card"><div class="bad">🔴 SPIKE ACTIVE</div>`;
+      html += line("Started", fmt(active.startedAt));
+      html += line("Current RAM", `${Number(active.currentMemoryGB || 0).toFixed(2)} GB`);
+      html += line("Current CPU", `${Number(active.currentCpu || 0).toFixed(2)} vCPU`);
+      html += line("Peak RAM", `${Number(active.peakMemoryGB || 0).toFixed(2)} GB`);
+      html += line("Peak CPU", `${Number(active.peakCpu || 0).toFixed(2)} vCPU`);
+      html += line("WA Warning", active.warningSent ? "SENT" : "NOT SENT");
+      html += line("WA Critical", active.criticalSent ? "SENT" : "NOT SENT");
+      html += `</div>`;
+    } else {
+      html += `<div class="card"><div class="ok">🟢 CURRENT STATUS: NORMAL</div></div>`;
+    }
+
+    html += `<h3>20 kejadian terakhir</h3>`;
+    if (!history.length) html += `<div class="muted">Belum ada spike yang selesai tercatat.</div>`;
+    for (const item of history) {
+      html += `<div class="card">`;
+      html += line("Start", fmt(item.startedAt));
+      html += line("End", fmt(item.endedAt));
+      html += line("Duration", `${Math.max(1, Math.round(Number(item.durationMs || 0) / 60000))} menit`);
+      html += line("Peak RAM", `${Number(item.peakMemoryGB || 0).toFixed(2)} GB`);
+      html += line("Peak CPU", `${Number(item.peakCpu || 0).toFixed(2)} vCPU`);
+      html += line("WA Warning", item.warningSent ? "SENT" : "NOT SENT");
+      html += line("WA Critical", item.criticalSent ? "SENT" : "NOT SENT");
+      html += `</div>`;
+    }
+    html += `</body></html>`;
+    res.type("html").send(html);
+  } catch (err) {
+    console.error("SPIKE LOG ERROR:", err);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
@@ -1398,6 +1473,258 @@ async function recoverStuckProcessingJobs() {
 }
 
 
+// =====================================================
+// SPIKE MONITOR HELPERS
+// =====================================================
+function formatJakarta(value) {
+  try {
+    return new Intl.DateTimeFormat("id-ID", {
+      timeZone: "Asia/Jakarta",
+      day: "2-digit", month: "short", year: "numeric",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+      hour12: false
+    }).format(new Date(value));
+  } catch {
+    return String(value || "-");
+  }
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+async function sendAdminText(text) {
+  if (!EVOLUTION_API_URL || !EVOLUTION_API_KEY) {
+    throw new Error("Evolution API config missing for spike alert");
+  }
+
+  const baseUrl = String(EVOLUTION_API_URL).replace(/\/+$/, "");
+  const endpoint = `${baseUrl}/message/sendText/${encodeURIComponent(SPIKE_INSTANCE)}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        apikey: EVOLUTION_API_KEY
+      },
+      body: JSON.stringify({
+        number: ADMIN_WA_NUMBER,
+        text
+      }),
+      signal: controller.signal
+    });
+    const body = (await response.text()).trim();
+    if (!response.ok) {
+      throw new Error(`Evolution sendText HTTP ${response.status}: ${body}`);
+    }
+    return body;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchEvolutionRailwayMetrics() {
+  if (!RAILWAY_API_TOKEN) throw new Error("RAILWAY_API_TOKEN is missing");
+
+  const end = new Date();
+  const start = new Date(end.getTime() - 3 * 60 * 1000);
+  const query = `
+    query EvolutionSpikeMetrics(
+      $projectId: String!,
+      $environmentId: String!,
+      $serviceId: String!,
+      $startDate: DateTime!,
+      $endDate: DateTime!,
+      $sampleRateSeconds: Int!,
+      $measurements: [MetricMeasurement!]!
+    ) {
+      metrics(
+        projectId: $projectId,
+        environmentId: $environmentId,
+        serviceId: $serviceId,
+        startDate: $startDate,
+        endDate: $endDate,
+        sampleRateSeconds: $sampleRateSeconds,
+        measurements: $measurements
+      ) {
+        measurement
+        values { ts value }
+      }
+    }
+  `;
+
+  const response = await fetch(RAILWAY_GRAPHQL_URL, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${RAILWAY_API_TOKEN}`
+    },
+    body: JSON.stringify({
+      query,
+      variables: {
+        projectId: RAILWAY_PROJECT_ID,
+        environmentId: RAILWAY_ENVIRONMENT_ID,
+        serviceId: RAILWAY_EVOLUTION_SERVICE_ID,
+        startDate: start.toISOString(),
+        endDate: end.toISOString(),
+        sampleRateSeconds: 60,
+        measurements: ["CPU_USAGE", "MEMORY_USAGE_GB"]
+      }
+    })
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.errors) {
+    const msg = payload?.errors?.map((e) => e.message).join(" | ") || `HTTP ${response.status}`;
+    throw new Error(`Railway metrics API: ${msg}`);
+  }
+
+  const rows = Array.isArray(payload?.data?.metrics) ? payload.data.metrics : [];
+  const latest = (measurement) => {
+    const row = rows.find((r) => String(r.measurement).toUpperCase() === measurement);
+    const values = Array.isArray(row?.values) ? row.values : [];
+    if (!values.length) return 0;
+    const last = values[values.length - 1];
+    return Number(last?.value || 0);
+  };
+
+  return {
+    cpu: latest("CPU_USAGE"),
+    memoryGB: latest("MEMORY_USAGE_GB"),
+    checkedAt: end.toISOString()
+  };
+}
+
+async function saveSpikeState(state) {
+  await redis.set(SPIKE_STATE_KEY, JSON.stringify(state));
+}
+
+async function finishSpike(state, endedAt) {
+  const finished = {
+    ...state,
+    active: false,
+    endedAt,
+    durationMs: new Date(endedAt).getTime() - new Date(state.startedAt).getTime()
+  };
+  delete finished.normalSince;
+  await redis.lPush(SPIKE_HISTORY_KEY, JSON.stringify(finished));
+  await redis.lTrim(SPIKE_HISTORY_KEY, 0, SPIKE_HISTORY_LIMIT - 1);
+  await redis.del(SPIKE_STATE_KEY);
+  console.log(`SPIKE END | peak RAM ${finished.peakMemoryGB.toFixed(2)} GB | peak CPU ${finished.peakCpu.toFixed(2)} vCPU | duration ${Math.round(finished.durationMs / 60000)} min`);
+}
+
+async function runSpikeMonitorOnce() {
+  const metrics = await fetchEvolutionRailwayMetrics();
+  const nowMs = new Date(metrics.checkedAt).getTime();
+  const isHigh = metrics.memoryGB >= SPIKE_MEMORY_GB || metrics.cpu >= SPIKE_CPU_VCPU;
+
+  console.log(`SPIKE MONITOR | CPU ${metrics.cpu.toFixed(2)} vCPU | RAM ${metrics.memoryGB.toFixed(2)} GB | ${isHigh ? "HIGH" : "NORMAL"}`);
+
+  const raw = await redis.get(SPIKE_STATE_KEY);
+  let state = raw ? JSON.parse(raw) : null;
+
+  if (!state && !isHigh) return;
+
+  if (!state && isHigh) {
+    state = {
+      active: true,
+      startedAt: metrics.checkedAt,
+      lastCheckedAt: metrics.checkedAt,
+      currentCpu: metrics.cpu,
+      currentMemoryGB: metrics.memoryGB,
+      peakCpu: metrics.cpu,
+      peakMemoryGB: metrics.memoryGB,
+      warningSent: false,
+      criticalSent: false,
+      normalSince: null
+    };
+    await saveSpikeState(state);
+    console.warn(`SPIKE START | CPU ${metrics.cpu.toFixed(2)} | RAM ${metrics.memoryGB.toFixed(2)} GB`);
+    return;
+  }
+
+  state.lastCheckedAt = metrics.checkedAt;
+  state.currentCpu = metrics.cpu;
+  state.currentMemoryGB = metrics.memoryGB;
+  state.peakCpu = Math.max(Number(state.peakCpu || 0), metrics.cpu);
+  state.peakMemoryGB = Math.max(Number(state.peakMemoryGB || 0), metrics.memoryGB);
+
+  if (isHigh) {
+    state.normalSince = null;
+    const durationMs = nowMs - new Date(state.startedAt).getTime();
+
+    if (!state.warningSent && durationMs >= SPIKE_WARNING_AFTER_MS) {
+      const msg = `⚠️ EVOLUTION API WARNING\nResource tinggi sudah ±${Math.round(durationMs / 60000)} menit.\nRAM: ${metrics.memoryGB.toFixed(2)} GB (peak ${state.peakMemoryGB.toFixed(2)} GB)\nCPU: ${metrics.cpu.toFixed(2)} vCPU (peak ${state.peakCpu.toFixed(2)} vCPU)\n\nCek: https://jastip-worker-production.up.railway.app/spike-log`;
+      try {
+        await sendAdminText(msg);
+        state.warningSent = true;
+        state.warningSentAt = metrics.checkedAt;
+        console.warn("SPIKE WARNING WA SENT");
+      } catch (err) {
+        console.error("SPIKE WARNING WA ERROR:", err.message);
+      }
+    }
+
+    if (!state.criticalSent && durationMs >= SPIKE_CRITICAL_AFTER_MS) {
+      const msg = `🚨 EVOLUTION API CRITICAL\nResource masih tinggi ±${Math.round(durationMs / 60000)} menit.\nRAM: ${metrics.memoryGB.toFixed(2)} GB (peak ${state.peakMemoryGB.toFixed(2)} GB)\nCPU: ${metrics.cpu.toFixed(2)} vCPU (peak ${state.peakCpu.toFixed(2)} vCPU)\n\nTidak ada auto-restart.\nCek: https://jastip-worker-production.up.railway.app/spike-log`;
+      try {
+        await sendAdminText(msg);
+        state.criticalSent = true;
+        state.criticalSentAt = metrics.checkedAt;
+        console.error("SPIKE CRITICAL WA SENT");
+      } catch (err) {
+        console.error("SPIKE CRITICAL WA ERROR:", err.message);
+      }
+    }
+
+    await saveSpikeState(state);
+    return;
+  }
+
+  if (!state.normalSince) {
+    state.normalSince = metrics.checkedAt;
+    await saveSpikeState(state);
+    return;
+  }
+
+  const normalForMs = nowMs - new Date(state.normalSince).getTime();
+  if (normalForMs >= SPIKE_RECOVERY_AFTER_MS) {
+    await finishSpike(state, metrics.checkedAt);
+  } else {
+    await saveSpikeState(state);
+  }
+}
+
+function startSpikeMonitor() {
+  if (!RAILWAY_API_TOKEN) {
+    console.warn("SPIKE MONITOR DISABLED: RAILWAY_API_TOKEN missing");
+    return;
+  }
+
+  console.log("SPIKE MONITOR STARTED: Evolution API checked every 60 seconds");
+
+  const tick = async () => {
+    try {
+      await runSpikeMonitorOnce();
+    } catch (err) {
+      // Monitor tidak boleh menjatuhkan Jastip Worker.
+      console.error("SPIKE MONITOR ERROR:", err.message);
+    }
+  };
+
+  setTimeout(tick, 5000);
+  setInterval(tick, SPIKE_CHECK_INTERVAL_MS);
+}
+
+
 async function start() {
   if (!REDIS_URL) {
     console.error("REDIS_URL IS MISSING");
@@ -1421,6 +1748,9 @@ async function start() {
       );
     }
   );
+
+  // Spike monitor berjalan terpisah dan tidak mengubah alur FIX/MAU.
+  startSpikeMonitor();
 
   worker().catch((err) => {
     console.error(
