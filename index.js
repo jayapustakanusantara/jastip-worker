@@ -1,4 +1,4 @@
-// JASTIP WORKER V3.7 - V3.6 + DELETE LOCK/TIMEOUT FIX
+// JASTIP WORKER V3.8 - V3.7 + EVOLUTION EMPTY-BUBBLE BUG GUARD
 const express = require("express");
 const { createClient } = require("redis");
 
@@ -26,6 +26,18 @@ const RAILWAY_EVOLUTION_SERVICE_ID = process.env.RAILWAY_EVOLUTION_SERVICE_ID ||
 const RAILWAY_GRAPHQL_URL = process.env.RAILWAY_GRAPHQL_URL || "https://backboard.railway.com/graphql/v2";
 const ADMIN_WA_NUMBER = process.env.ADMIN_WA_NUMBER || "6283193967234";
 const SPIKE_INSTANCE = process.env.SPIKE_INSTANCE || "Jastip-bot";
+
+// Guard bug Evolution/Baileys yang dapat mengirim bubble kosong ke grup.
+// Default hanya monitor; auto logout harus diaktifkan eksplisit di Railway.
+const BUBBLE_GUARD_ENABLED =
+  String(process.env.BUBBLE_GUARD_ENABLED || "true").toLowerCase() !== "false";
+const BUBBLE_GUARD_AUTO_DISCONNECT =
+  String(process.env.BUBBLE_GUARD_AUTO_DISCONNECT || "false").toLowerCase() === "true";
+const BUBBLE_GUARD_THRESHOLD = Math.max(2, Number(process.env.BUBBLE_GUARD_THRESHOLD || 3));
+const BUBBLE_GUARD_WINDOW_SECONDS = Math.max(30, Number(process.env.BUBBLE_GUARD_WINDOW_SECONDS || 90));
+const BUBBLE_GUARD_HISTORY_KEY = "jastip:bubble-guard:history";
+const BUBBLE_GUARD_LAST_KEY = "jastip:bubble-guard:last";
+const BUBBLE_GUARD_ACTION_LOCK_KEY = "jastip:bubble-guard:action-lock";
 
 const SPIKE_CHECK_INTERVAL_MS = 60 * 1000; // 1 menit
 const SPIKE_MEMORY_GB = 1.0;
@@ -76,6 +88,27 @@ app.get("/health", (req, res) => {
     ok: true,
     redis: redis.isReady
   });
+});
+
+// Status bubble guard, dapat dibuka dari HP.
+app.get("/bubble-guard", async (req, res) => {
+  try {
+    const lastRaw = await redis.get(BUBBLE_GUARD_LAST_KEY);
+    const historyRaw = await redis.lRange(BUBBLE_GUARD_HISTORY_KEY, 0, 19);
+    return res.json({
+      ok: true,
+      enabled: BUBBLE_GUARD_ENABLED,
+      autoDisconnect: BUBBLE_GUARD_AUTO_DISCONNECT,
+      threshold: BUBBLE_GUARD_THRESHOLD,
+      windowSeconds: BUBBLE_GUARD_WINDOW_SECONDS,
+      last: lastRaw ? JSON.parse(lastRaw) : null,
+      history: historyRaw.map((item) => {
+        try { return JSON.parse(item); } catch { return null; }
+      }).filter(Boolean)
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 /*
@@ -239,6 +272,33 @@ app.post("/", async (req, res) => {
       outerKey.fromMe === true ||
       data.fromMe === true;
 
+    const message =
+      data.message ||
+      {};
+
+    // Hanya outgoing blank upsert di grup. Reaction dan protocol message
+    // dikecualikan oleh isSuspiciousOutgoingBlankMessage().
+    if (
+      BUBBLE_GUARD_ENABLED &&
+      isOrderEvent &&
+      fromMe &&
+      SUPPORTED_GROUPS.has(remoteJid) &&
+      isSuspiciousOutgoingBlankMessage(message)
+    ) {
+      const guardResult = await recordSuspiciousBlankBubble({
+        instance,
+        groupId: remoteJid,
+        messageId
+      });
+
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+        reason: "suspected Evolution empty-bubble bug",
+        bubbleGuard: guardResult
+      });
+    }
+
     if (isCancellationEvent && fromMe) {
       console.log(
         "DELETE IGNORED: fromMe=true |",
@@ -401,10 +461,6 @@ app.post("/", async (req, res) => {
         messageId
       });
     }
-
-    const message =
-      data.message ||
-      {};
 
     const text = extractMessageText(message);
 
@@ -1312,6 +1368,116 @@ async function sendReaction(job, emoji) {
   }
 }
 
+
+function isSuspiciousOutgoingBlankMessage(message) {
+  if (!message || typeof message !== "object") return false;
+
+  // Tipe internal/non-visible yang normal dan tidak boleh dihitung.
+  if (
+    message.reactionMessage ||
+    message.protocolMessage ||
+    message.senderKeyDistributionMessage ||
+    message.pollUpdateMessage ||
+    message.editedMessage ||
+    message.keepInChatMessage
+  ) {
+    return false;
+  }
+
+  if (extractMessageText(message)) return false;
+
+  const contentKeys = Object.keys(message).filter(
+    (key) => key !== "messageContextInfo" && key !== "deviceListMetadata"
+  );
+
+  // Bubble bug biasanya berupa conversation/text kosong atau envelope kosong.
+  return (
+    contentKeys.length === 0 ||
+    Object.prototype.hasOwnProperty.call(message, "conversation") ||
+    Object.prototype.hasOwnProperty.call(message, "extendedTextMessage")
+  );
+}
+
+async function disconnectEvolutionInstance(instance) {
+  if (!EVOLUTION_API_URL || !EVOLUTION_API_KEY) {
+    throw new Error("Evolution API config missing for bubble guard");
+  }
+
+  const baseUrl = String(EVOLUTION_API_URL).replace(/\/+$/, "");
+  const endpoint = `${baseUrl}/instance/logout/${encodeURIComponent(instance)}`;
+  const response = await fetch(endpoint, {
+    method: "DELETE",
+    headers: { apikey: EVOLUTION_API_KEY }
+  });
+  const body = (await response.text()).trim();
+  if (!response.ok) {
+    throw new Error(`Evolution logout HTTP ${response.status}: ${body}`);
+  }
+  return body;
+}
+
+async function recordSuspiciousBlankBubble(info) {
+  const groupId = String(info.groupId || "");
+  const instance = String(info.instance || SPIKE_INSTANCE);
+  const counterKey = `jastip:bubble-guard:count:${groupId}`;
+  const count = await redis.incr(counterKey);
+  if (count === 1) {
+    await redis.expire(counterKey, BUBBLE_GUARD_WINDOW_SECONDS);
+  }
+
+  const event = {
+    detectedAt: new Date().toISOString(),
+    instance,
+    groupId,
+    messageId: String(info.messageId || ""),
+    count,
+    threshold: BUBBLE_GUARD_THRESHOLD,
+    autoDisconnect: BUBBLE_GUARD_AUTO_DISCONNECT,
+    action: "MONITOR"
+  };
+
+  console.error(
+    `BUBBLE GUARD DETECTED | group=${groupId} | count=${count}/${BUBBLE_GUARD_THRESHOLD} | message=${event.messageId || "MISSING"}`
+  );
+
+  if (count >= BUBBLE_GUARD_THRESHOLD) {
+    const claimed = await redis.set(
+      BUBBLE_GUARD_ACTION_LOCK_KEY,
+      "1",
+      { NX: true, EX: 300 }
+    );
+
+    if (claimed) {
+      try {
+        await sendAdminText(
+          `🚨 BUBBLE KOSONG TERDETEKSI\n${count} pesan kosong dari Evolution dalam ${BUBBLE_GUARD_WINDOW_SECONDS} detik.\nGroup: ${groupId}\nMode: ${BUBBLE_GUARD_AUTO_DISCONNECT ? "AUTO DISCONNECT" : "MONITOR SAJA"}`
+        );
+      } catch (alertError) {
+        console.error("BUBBLE GUARD ALERT ERROR:", alertError.message);
+      }
+
+      if (BUBBLE_GUARD_AUTO_DISCONNECT) {
+        try {
+          await disconnectEvolutionInstance(instance);
+          event.action = "DISCONNECTED";
+          console.error("BUBBLE GUARD: EVOLUTION INSTANCE DISCONNECTED", instance);
+        } catch (disconnectError) {
+          event.action = "DISCONNECT_FAILED";
+          event.error = disconnectError.message;
+          console.error("BUBBLE GUARD DISCONNECT ERROR:", disconnectError.message);
+        }
+      } else {
+        event.action = "ALERTED";
+      }
+    }
+  }
+
+  await redis.set(BUBBLE_GUARD_LAST_KEY, JSON.stringify(event));
+  await redis.lPush(BUBBLE_GUARD_HISTORY_KEY, JSON.stringify(event));
+  await redis.lTrim(BUBBLE_GUARD_HISTORY_KEY, 0, 19);
+
+  return { count, action: event.action };
+}
 
 function extractMessageText(message) {
   if (!message || typeof message !== "object") {
