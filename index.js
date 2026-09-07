@@ -1,4 +1,4 @@
-// JASTIP WORKER V3.6 - DELETE LOOP GUARD + RAILWAY TOKEN FIX
+// JASTIP WORKER V3.7 - V3.6 + DELETE LOCK/TIMEOUT FIX
 const express = require("express");
 const { createClient } = require("redis");
 
@@ -880,7 +880,10 @@ async function worker() {
           rawJob
         );
 
-        if (retryCount <= 20) {
+        const maxBridgeRetry =
+          isCancellation ? 10 : 20;
+
+        if (retryCount <= maxBridgeRetry) {
           await redis.rPush(
             QUEUE_NAME,
             JSON.stringify(retryJob)
@@ -893,9 +896,12 @@ async function worker() {
             retryCount
           );
 
-          await sleep(
-            Math.min(30000, 1500 * retryCount)
-          );
+          const retryDelayMs =
+            isCancellation
+              ? Math.min(60000, 10000 * retryCount)
+              : Math.min(30000, 1500 * retryCount);
+
+          await sleep(retryDelayMs);
 
         } else {
           await redis.lPush(
@@ -1152,9 +1158,17 @@ async function sendJobToAppsScript(job) {
   };
 
   const controller = new AbortController();
+
+  // Cancellation dapat menunggu Apps Script lock sampai 30 detik.
+  // Timeout lebih panjang mencegah retry palsu saat proses masih berjalan.
+  const timeoutMs =
+    isCancellation
+      ? 65000
+      : 20000;
+
   const timeout = setTimeout(
     () => controller.abort(),
-    20000
+    timeoutMs
   );
 
   try {
@@ -1199,7 +1213,7 @@ async function sendJobToAppsScript(job) {
   } catch (err) {
     if (err && err.name === "AbortError") {
       throw new Error(
-        "Apps Script timeout after 20s"
+        `Apps Script timeout after ${Math.round(timeoutMs / 1000)}s`
       );
     }
 
