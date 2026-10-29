@@ -1695,6 +1695,7 @@ function escapeHtml(value) {
 }
 
 async function sendAdminText(text) {
+  return "SEND_TEXT_DISABLED";
   if (!EVOLUTION_API_URL || !EVOLUTION_API_KEY) {
     throw new Error("Evolution API config missing for spike alert");
   }
