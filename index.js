@@ -2,6 +2,9 @@
 const express = require("express");
 const { createClient } = require("redis");
 
+// Routine logs are disabled by default. Errors retain their existing paths.
+function debugLog() { /* deliberately omit routine/customer payloads */ }
+
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
@@ -69,7 +72,7 @@ redis.on("error", (err) => {
 });
 
 redis.on("ready", () => {
-  console.log("Redis READY");
+  debugLog("Redis READY");
 });
 
 app.get("/", (req, res) => {
@@ -300,7 +303,7 @@ app.post("/", async (req, res) => {
     }
 
     if (isCancellationEvent && fromMe) {
-      console.log(
+      debugLog(
         "DELETE IGNORED: fromMe=true |",
         messageId || "MISSING"
       );
@@ -314,7 +317,7 @@ app.post("/", async (req, res) => {
     }
 
     if (isCancellationEvent) {
-      console.log(
+      debugLog(
         "DELETE EVENT RECEIVED:",
         normalizedEvent,
         "| protocol:",
@@ -438,7 +441,7 @@ app.post("/", async (req, res) => {
         JSON.stringify(cancelJob)
       );
 
-      console.log(
+      debugLog(
         "DELETE TARGET RESOLVED:",
         messageId,
         "|",
@@ -447,7 +450,7 @@ app.post("/", async (req, res) => {
         cleanPhone(participantAlt || participant) || "unknown"
       );
 
-      console.log(
+      debugLog(
         "DELETE QUEUED:",
         messageId,
         "|",
@@ -461,6 +464,10 @@ app.post("/", async (req, res) => {
         messageId
       });
     }
+
+    // Outgoing bot messages never become customer orders. Keep delete and
+    // bubble detection above this guard so their existing paths are preserved.
+    if (fromMe) return res.status(200).json({ ok: true, ignored: true, reason: "bot message" });
 
     const text = extractMessageText(message);
 
@@ -525,7 +532,7 @@ app.post("/", async (req, res) => {
     );
 
     if (!firstTime) {
-      console.log("DUPLICATE WEBHOOK:", messageId);
+      debugLog("DUPLICATE WEBHOOK:", messageId);
 
       return res.status(200).json({
         ok: true,
@@ -539,7 +546,7 @@ app.post("/", async (req, res) => {
       JSON.stringify(job)
     );
 
-    console.log(
+    debugLog(
       "QUEUED:",
       messageId,
       "|",
@@ -740,7 +747,7 @@ app.get("/spike-log", async (req, res) => {
   Error teknis Apps Script masih boleh retry.
 */
 async function worker() {
-  console.log("Worker started...");
+  debugLog("Worker started...");
 
   while (true) {
     try {
@@ -759,7 +766,7 @@ async function worker() {
       try {
         job = JSON.parse(rawJob);
       } catch (err) {
-        console.error("INVALID JOB:", rawJob);
+        console.error("INVALID_JOB: malformed queue payload");
 
         await redis.lRem(
           PROCESSING_QUEUE,
@@ -777,19 +784,10 @@ async function worker() {
 
       const queueWaitingNow = await redis.lLen(QUEUE_NAME);
       const queueProcessingNow = await redis.lLen(PROCESSING_QUEUE);
-      console.log(`QUEUE: ${queueWaitingNow + queueProcessingNow} (waiting ${queueWaitingNow}, processing ${queueProcessingNow})`);
+      debugLog(`QUEUE: ${queueWaitingNow + queueProcessingNow} (waiting ${queueWaitingNow}, processing ${queueProcessingNow})`);
 
-      console.log("");
-      console.log("================================");
-      console.log("PROCESS JOB");
-      console.log("Message ID:", job.messageId);
-      console.log("Group:", job.groupId);
-      console.log("Sender:", job.senderPhone);
-      console.log("Name:", job.pushName);
-      console.log("Text:", job.text);
-      console.log("Quoted:", job.quotedProduct);
-      console.log("================================");
-      console.log("");
+      // Customer content is deliberately omitted from routine logs.
+
 
       /*
         VALIDASI CEPAT DI RAILWAY.
@@ -813,7 +811,7 @@ async function worker() {
           : validateOrderJob(job);
 
       if (!validation.ok) {
-        console.log(
+        debugLog(
           "INVALID ORDER:",
           job.messageId,
           "|",
@@ -823,7 +821,7 @@ async function worker() {
         try {
           await sendReaction(job, "❌");
 
-          console.log(
+          debugLog(
             "INVALID REACTION SENT:",
             job.messageId,
             "| ❌"
@@ -847,7 +845,7 @@ async function worker() {
           rawJob
         );
 
-        console.log(
+        debugLog(
           "INVALID DONE - NO RETRY:",
           job.messageId
         );
@@ -864,12 +862,9 @@ async function worker() {
           rawJob
         );
 
-        console.log(
-          "SHEET ACCEPTED:",
-          job.messageId,
-          "|",
-          result
-        );
+        if (!isCancellation && (result === "QUEUED" || result === "ALREADY QUEUED")) {
+          console.log("ORDER_ACCEPTED"); // Apps Script acceptance, not confirmed Sheets write.
+        }
 
       } catch (bridgeError) {
         console.error(
@@ -889,7 +884,7 @@ async function worker() {
           try {
             await sendReaction(job, "❌");
 
-            console.log(
+            debugLog(
               "BRIDGE INVALID REACTION SENT:",
               job.messageId,
               "| ❌"
@@ -909,7 +904,7 @@ async function worker() {
             rawJob
           );
 
-          console.log(
+          debugLog(
             "BRIDGE INVALID DONE - NO RETRY:",
             job.messageId
           );
@@ -945,7 +940,7 @@ async function worker() {
             JSON.stringify(retryJob)
           );
 
-          console.log(
+          debugLog(
             "REQUEUED:",
             job.messageId,
             "| retry",
@@ -1640,7 +1635,7 @@ async function recoverStuckProcessingJobs() {
   const stuckCount = await redis.lLen(PROCESSING_QUEUE);
 
   if (stuckCount === 0) {
-    console.log("RECOVERY: no stuck processing jobs");
+    debugLog("RECOVERY: no stuck processing jobs");
     return;
   }
 
@@ -1663,7 +1658,7 @@ async function recoverStuckProcessingJobs() {
     recovered += 1;
   }
 
-  console.log(
+  debugLog(
     `RECOVERY DONE: ${recovered} job(s) returned to queue`
   );
 }
@@ -1728,84 +1723,12 @@ async function sendAdminText(text) {
 }
 
 async function fetchEvolutionRailwayMetrics() {
-  if (!RAILWAY_API_TOKEN && !RAILWAY_PROJECT_TOKEN) {
-    throw new Error("RAILWAY_API_TOKEN atau RAILWAY_TOKEN is missing");
-  }
-
-  const railwayHeaders = {
-    "content-type": "application/json"
-  };
-
-  if (RAILWAY_PROJECT_TOKEN) {
-    railwayHeaders["Project-Access-Token"] = RAILWAY_PROJECT_TOKEN;
-  } else {
-    railwayHeaders.authorization = `Bearer ${RAILWAY_API_TOKEN}`;
-  }
-
-  const end = new Date();
-  const start = new Date(end.getTime() - 3 * 60 * 1000);
-  const query = `
-    query EvolutionSpikeMetrics(
-      $projectId: String!,
-      $environmentId: String!,
-      $serviceId: String!,
-      $startDate: DateTime!,
-      $endDate: DateTime!,
-      $sampleRateSeconds: Int!,
-      $measurements: [MetricMeasurement!]!
-    ) {
-      metrics(
-        projectId: $projectId,
-        environmentId: $environmentId,
-        serviceId: $serviceId,
-        startDate: $startDate,
-        endDate: $endDate,
-        sampleRateSeconds: $sampleRateSeconds,
-        measurements: $measurements
-      ) {
-        measurement
-        values { ts value }
-      }
-    }
-  `;
-
-  const response = await fetch(RAILWAY_GRAPHQL_URL, {
-    method: "POST",
-    headers: railwayHeaders,
-    body: JSON.stringify({
-      query,
-      variables: {
-        projectId: RAILWAY_PROJECT_ID,
-        environmentId: RAILWAY_ENVIRONMENT_ID,
-        serviceId: RAILWAY_EVOLUTION_SERVICE_ID,
-        startDate: start.toISOString(),
-        endDate: end.toISOString(),
-        sampleRateSeconds: 60,
-        measurements: ["CPU_USAGE", "MEMORY_USAGE_GB"]
-      }
-    })
-  });
-
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok || payload.errors) {
-    const msg = payload?.errors?.map((e) => e.message).join(" | ") || `HTTP ${response.status}`;
-    throw new Error(`Railway metrics API: ${msg}`);
-  }
-
-  const rows = Array.isArray(payload?.data?.metrics) ? payload.data.metrics : [];
-  const latest = (measurement) => {
-    const row = rows.find((r) => String(r.measurement).toUpperCase() === measurement);
-    const values = Array.isArray(row?.values) ? row.values : [];
-    if (!values.length) return 0;
-    const last = values[values.length - 1];
-    return Number(last?.value || 0);
-  };
-
-  return {
-    cpu: latest("CPU_USAGE"),
-    memoryGB: latest("MEMORY_USAGE_GB"),
-    checkedAt: end.toISOString()
-  };
+  const { readMetrics, latestReading } = require("./lib/railway-metrics.cjs");
+  const end = Date.now();
+  const env = { ...process.env, RAILWAY_PROJECT_ID, RAILWAY_ENVIRONMENT_ID,
+    RAILWAY_EVOLUTION_SERVICE_ID, RAILWAY_GRAPHQL_URL };
+  const series = await readMetrics({ env, start: end - 3 * 60000, end });
+  return latestReading(series, end);
 }
 
 async function saveSpikeState(state) {
@@ -1831,7 +1754,7 @@ async function runSpikeMonitorOnce() {
   const nowMs = new Date(metrics.checkedAt).getTime();
   const isHigh = metrics.memoryGB >= SPIKE_MEMORY_GB || metrics.cpu >= SPIKE_CPU_VCPU;
 
-  console.log(`SPIKE MONITOR | CPU ${metrics.cpu.toFixed(2)} vCPU | RAM ${metrics.memoryGB.toFixed(2)} GB | ${isHigh ? "HIGH" : "NORMAL"}`);
+  // Log state transitions below, not every successful metrics poll.
 
   const raw = await redis.get(SPIKE_STATE_KEY);
   let state = raw ? JSON.parse(raw) : null;
@@ -1856,6 +1779,11 @@ async function runSpikeMonitorOnce() {
     return;
   }
 
+  // A gap in observations cannot establish five continuous normal minutes.
+  if (nowMs <= Date.parse(state.lastCheckedAt)) return;
+  if (nowMs - Date.parse(state.lastCheckedAt) > 2 * SPIKE_CHECK_INTERVAL_MS) {
+    state.normalSince = null;
+  }
   state.lastCheckedAt = metrics.checkedAt;
   state.currentCpu = metrics.cpu;
   state.currentMemoryGB = metrics.memoryGB;
@@ -1895,6 +1823,7 @@ async function runSpikeMonitorOnce() {
   }
 
   if (!state.normalSince) {
+    console.log(`SPIKE_NORMAL_DETECTED RAM=${metrics.memoryGB.toFixed(2)}GB CPU=${metrics.cpu.toFixed(2)}`);
     state.normalSince = metrics.checkedAt;
     await saveSpikeState(state);
     return;
@@ -1914,15 +1843,26 @@ function startSpikeMonitor() {
     return;
   }
 
-  console.log("SPIKE MONITOR STARTED: Evolution API checked every 60 seconds");
+  debugLog("SPIKE MONITOR STARTED: Evolution API checked every 60 seconds");
 
+  let running = false;
+  let lastError = "";
+  let lastErrorAt = 0;
   const tick = async () => {
+    if (running) return;
+    running = true;
     try {
       await runSpikeMonitorOnce();
+      if (lastError) console.log("METRICS_RECOVERED");
+      lastError = "";
     } catch (err) {
-      // Monitor tidak boleh menjatuhkan Jastip Worker.
-      console.error("SPIKE MONITOR ERROR:", err.message);
-    }
+      // Monitor failure never stops order processing; repeated errors are bounded.
+      if (err.message !== lastError || Date.now() - lastErrorAt >= 15 * 60000) {
+        console.error("SPIKE MONITOR ERROR:", err.message);
+        lastErrorAt = Date.now();
+      }
+      lastError = err.message;
+    } finally { running = false; }
   };
 
   setTimeout(tick, 5000);
@@ -1936,11 +1876,11 @@ async function start() {
     process.exit(1);
   }
 
-  console.log("Connecting Redis...");
+  debugLog("Connecting Redis...");
 
   await redis.connect();
 
-  console.log("Redis connected.");
+  debugLog("Redis connected.");
 
   await recoverStuckProcessingJobs();
 
@@ -1948,7 +1888,7 @@ async function start() {
     PORT,
     "0.0.0.0",
     () => {
-      console.log(
+      debugLog(
         `Jastip Worker running on port ${PORT}`
       );
     }
@@ -1972,3 +1912,4 @@ start().catch((err) => {
   console.error("START ERROR:", err);
   process.exit(1);
 });
+
