@@ -14,8 +14,15 @@ const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
 const WORKER_SECRET = process.env.WORKER_SECRET;
 
 // Tambahan untuk reaction ❌ langsung dari Railway worker ke Evolution API
-const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL;
-const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY;
+const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL;const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY;
+
+// TRACE / Reply Private is intentionally isolated from the order queue.
+// This secret is kept only in Railway and Google Apps Script Script Properties;
+// it is never returned to the Admin Portal browser.
+const TRACE_PORTAL_SECRET = process.env.TRACE_PORTAL_SECRET || WORKER_SECRET;
+const TRACE_SOURCE_GROUPS_JSON = process.env.TRACE_SOURCE_GROUPS_JSON || "";
+const TRACE_REPLY_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+const TRACE_REPLY_INSTANCE = process.env.TRACE_REPLY_INSTANCE || "Jastip-bot";
 
 
 // =====================================================
@@ -1913,3 +1920,120 @@ start().catch((err) => {
   process.exit(1);
 });
 
+// TRACE REPLY PRIVATE ENDPOINT
+
+// TRACE Reply Private: isolated from order queue, Sheets, and normal webhook flow.
+app.post("/trace/reply-private", async (req, res) => {
+  try {
+    if (!hasValidTraceSecret_(req)) {
+      return res.status(401).json({ ok: false, error: "Unauthorized trace request." });
+    }
+    const checked = validateTraceReplyRequest_(req.body || {});
+    if (!checked.ok) return res.status(400).json({ ok: false, error: checked.error });
+
+    const original = await findOriginalEvolutionMessage_(checked.value);
+    if (!original) {
+      return res.status(404).json({ ok: false, error: "Original WhatsApp message not available for native quote." });
+    }
+    await sendNativePrivateQuote_(checked.value, original);
+    return res.json({ ok: true, nativeQuote: true });
+  } catch (err) {
+    console.error("TRACE REPLY PRIVATE ERROR:", err.message);
+    const unavailable = String(err.message || "").includes("Original WhatsApp message not available");
+    return res.status(unavailable ? 404 : 502).json({
+      ok: false,
+      error: unavailable ? "Original WhatsApp message not available for native quote." : "Reply Private could not be sent."
+    });
+  }
+});
+
+function hasValidTraceSecret_(req) {
+  const supplied = String(req.get("x-bma-trace-secret") || "");
+  const expected = String(TRACE_PORTAL_SECRET || "");
+  if (!supplied || !expected) return false;
+  const left = Buffer.from(supplied);
+  const right = Buffer.from(expected);
+  return left.length === right.length && require("crypto").timingSafeEqual(left, right);
+}
+
+function normalizeTracePhone_(value) {
+  return String(value || "").replace(/\D/g, "").replace(/^0/, "62");
+}
+
+function traceSourceGroups_() {
+  if (!TRACE_SOURCE_GROUPS_JSON) throw new Error("TRACE_SOURCE_GROUPS_JSON is missing");
+  try {
+    const groups = JSON.parse(TRACE_SOURCE_GROUPS_JSON);
+    if (!groups || typeof groups !== "object" || Array.isArray(groups)) throw new Error("must be an object");
+    return groups;
+  } catch (err) {
+    throw new Error("Invalid TRACE_SOURCE_GROUPS_JSON: " + err.message);
+  }
+}
+
+function validateTraceReplyRequest_(input) {
+  const source = String(input.source || "").trim();
+  const groupId = String(input.groupId || "").trim();
+  const messageId = String(input.messageId || "").trim();
+  const customerPhone = normalizeTracePhone_(input.customerPhone);
+  const qty = Number(input.qty);
+  const orderAt = new Date(input.orderAt);
+  const replyText = String(input.replyText || "").trim();
+  if (!source) return { ok: false, error: "source required" };
+  if (!groupId || !groupId.endsWith("@g.us")) return { ok: false, error: "valid groupId required" };
+  if (!messageId) return { ok: false, error: "messageId required" };
+  if (!/^62\d{8,15}$/.test(customerPhone)) return { ok: false, error: "valid customerPhone required" };
+  if (!Number.isFinite(qty) || qty <= 0) return { ok: false, error: "Qty must be greater than 0" };
+  if (Number.isNaN(orderAt.getTime()) || Date.now() - orderAt.getTime() > TRACE_REPLY_MAX_AGE_MS || orderAt.getTime() > Date.now() + 300000) {
+    return { ok: false, error: "Order must be within the last 14 days" };
+  }
+  if (!replyText || replyText.length > 4096) return { ok: false, error: "replyText required (max 4096 characters)" };
+  if (String(traceSourceGroups_()[source] || "") !== groupId || !SUPPORTED_GROUPS.has(groupId)) {
+    return { ok: false, error: "Group ID is not allowed for this source" };
+  }
+  return { ok: true, value: { source, groupId, messageId, customerPhone, qty, orderAt, replyText, instance: String(input.instance || TRACE_REPLY_INSTANCE) } };
+}
+
+function traceCandidate_(payload) {
+  const data = payload && (payload.response || payload.data || payload);
+  const list = Array.isArray(data) ? data : (data && (data.messages || data.records || data.items));
+  return Array.isArray(list) ? (list[0] || null) : null;
+}
+
+function traceParticipantIds_(candidate, key) {
+  const nested = candidate && candidate.message && candidate.message.key;
+  return [key && key.participant, key && key.participantAlt, candidate && candidate.participant, candidate && candidate.participantAlt, nested && nested.participant, nested && nested.participantAlt].filter(Boolean).map(String);
+}
+
+async function findOriginalEvolutionMessage_(request) {
+  if (!EVOLUTION_API_URL || !EVOLUTION_API_KEY) throw new Error("Original WhatsApp message not available for native quote.");
+  const endpoint = String(EVOLUTION_API_URL).replace(/\/+$/, "") + "/chat/findMessages/" + encodeURIComponent(request.instance);
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json", apikey: EVOLUTION_API_KEY },
+    body: JSON.stringify({ where: { key: { remoteJid: request.groupId, fromMe: false, id: request.messageId } }, limit: 1 })
+  });
+  if (!response.ok) {
+    if (response.status === 404) throw new Error("Original WhatsApp message not available for native quote.");
+    throw new Error("Evolution message lookup HTTP " + response.status);
+  }
+  const candidate = traceCandidate_(await response.json());
+  const key = candidate && (candidate.key || (candidate.message && candidate.message.key));
+  const message = candidate && (candidate.message || candidate);
+  if (!key || !message || key.id !== request.messageId || key.remoteJid !== request.groupId || key.fromMe === true) {
+    throw new Error("Original WhatsApp message not available for native quote.");
+  }
+  const phones = traceParticipantIds_(candidate, key).filter((id) => /^(?:0|62)\d{8,15}(?:@|$)/.test(id)).map(normalizeTracePhone_);
+  if (phones.length && !phones.includes(request.customerPhone)) throw new Error("Original WhatsApp message not available for native quote.");
+  return { key, message };
+}
+
+async function sendNativePrivateQuote_(request, original) {
+  const endpoint = String(EVOLUTION_API_URL).replace(/\/+$/, "") + "/message/sendText/" + encodeURIComponent(request.instance);
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json", apikey: EVOLUTION_API_KEY },
+    body: JSON.stringify({ number: request.customerPhone, text: request.replyText, quoted: original })
+  });
+  if (!response.ok) throw new Error("Evolution quoted send HTTP " + response.status);
+}
