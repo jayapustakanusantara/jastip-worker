@@ -88,6 +88,82 @@ app.get("/", (req, res) => {
   });
 });
 
+
+/*
+ * Internal allocation-reaction endpoint.
+ * The Portal Admin sends only a validated original group/message reference.
+ * Never infer the participant from customer names or phone numbers.
+ */
+app.post("/internal/allocation-reaction", async (req, res) => {
+  const crypto = require("node:crypto");
+  const secret = String(process.env.REACTION_SYNC_SECRET || "");
+  const supplied = String(req.get("x-reaction-sync-secret") || "");
+  if (!secret || !supplied ||
+      Buffer.byteLength(secret) !== Buffer.byteLength(supplied) ||
+      !crypto.timingSafeEqual(Buffer.from(secret), Buffer.from(supplied))) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+
+  const groupId = String(req.body?.groupId || "").trim();
+  const messageId = String(req.body?.messageId || "").trim();
+  const emoji = String(req.body?.reaction || "").trim();
+  const sourceSheet = String(req.body?.sourceSheet || "").trim();
+
+  if (!SUPPORTED_GROUPS.has(groupId) ||
+      !/^[A-Za-z0-9_:\-]{4,160}$/.test(messageId) ||
+      !["🛒", "🟡", "✅"].includes(emoji) ||
+      !["ORDER BBW", "ORDER BBW JOGJA", "ORDER BBW GI", "ORDER LIVE"].includes(sourceSheet)) {
+    return res.status(400).json({ ok: false, error: "invalid_reference" });
+  }
+  if (!redis.isReady) {
+    return res.status(503).json({ ok: false, error: "redis_unavailable" });
+  }
+
+  const referenceName = reactionKeyCacheName(groupId, messageId);
+  const lastName = referenceName + ":last-reaction";
+  const lockName = referenceName + ":update-lock";
+  const lockValue = crypto.randomUUID();
+  try {
+    const lock = await redis.set(lockName, lockValue, { NX: true, EX: 20 });
+    if (lock !== "OK") {
+      return res.status(409).json({ ok: false, error: "reaction_update_busy" });
+    }
+    const raw = await redis.get(referenceName);
+    if (!raw) {
+      return res.status(404).json({ ok: false, error: "original_key_not_cached" });
+    }
+    const key = JSON.parse(raw);
+    if (key.groupId !== groupId || key.messageId !== messageId ||
+        !key.participant || !key.instance) {
+      return res.status(422).json({ ok: false, error: "invalid_cached_key" });
+    }
+
+    if (await redis.get(lastName) === emoji) {
+      return res.json({ ok: true, unchanged: true });
+    }
+
+    await sendReaction({
+      instance: key.instance,
+      groupId: key.groupId,
+      messageId: key.messageId,
+      participant: key.participant
+    }, emoji);
+    await redis.set(lastName, emoji, { EX: REACTION_KEY_CACHE_SECONDS });
+    return res.json({ ok: true, updated: true });
+  } catch (err) {
+    console.error("ALLOCATION REACTION ERROR:", err.message);
+    return res.status(502).json({ ok: false, error: "reaction_update_failed" });
+  } finally {
+    try {
+      if (await redis.get(lockName) === lockValue) {
+        await redis.del(lockName);
+      }
+    } catch (err) {
+      console.error("ALLOCATION REACTION LOCK ERROR:", err.message);
+    }
+  }
+});
+
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
