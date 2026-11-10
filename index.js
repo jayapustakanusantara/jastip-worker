@@ -52,6 +52,11 @@ const SPIKE_HISTORY_LIMIT = 20;
 const QUEUE_NAME = "jastip:queue";
 const PROCESSING_QUEUE = "jastip:processing";
 const DEAD_QUEUE = "jastip:dead";
+
+// Key WhatsApp asli untuk update reaction setelah admin menyimpan pembagian.
+// TTL sengaja terbatas agar Redis tidak menjadi arsip chat permanen.
+const REACTION_KEY_CACHE_SECONDS = 60 * 60 * 24 * 30;
+const REACTION_KEY_CACHE_PREFIX = "jastip:reaction-key:";
 const BBW_GROUP_ID = "120363414084709085@g.us";
 
 const SUPPORTED_GROUPS = new Set([
@@ -532,6 +537,21 @@ app.post("/", async (req, res) => {
         duplicate: true,
         messageId
       });
+    }
+
+    /*
+      Simpan referensi key persis dari Baileys selama 30 hari.
+      Cache tidak boleh menghambat FIX/MAU masuk Google Sheet.
+    */
+    try {
+      await cacheReactionKey(job);
+    } catch (cacheError) {
+      console.error(
+        "REACTION KEY CACHE ERROR:",
+        messageId,
+        "|",
+        cacheError.message
+      );
     }
 
     await redis.lPush(
@@ -1284,6 +1304,63 @@ async function sendJobToAppsScript(job) {
 /*
   Kirim reaction langsung dari Railway worker ke Evolution API.
 */
+/*
+  Redis tidak menyimpan API key atau isi percakapan.
+  Yang dicache hanya key asli Baileys untuk reaction tepat.
+*/
+function reactionKeyCacheName(groupId, messageId) {
+  const reference =
+    `${String(groupId || "")}\u0000${String(messageId || "")}`;
+
+  return REACTION_KEY_CACHE_PREFIX +
+    Buffer.from(reference).toString("base64url");
+}
+
+async function cacheReactionKey(job) {
+  const groupId = String(job?.groupId || "").trim();
+  const messageId = String(job?.messageId || "").trim();
+
+  const participant = String(
+    job?.participant ||
+    job?.rawKey?.participant ||
+    ""
+  ).trim();
+
+  if (!groupId || !messageId || !participant) {
+    console.warn(
+      "REACTION KEY CACHE SKIPPED: incomplete reference |",
+      messageId || "MISSING"
+    );
+    return false;
+  }
+
+  const cachedReference = {
+    version: 1,
+    instance: String(job.instance || "Jastip-bot"),
+    groupId,
+    messageId,
+    participant,
+    participantAlt: String(job.participantAlt || ""),
+    senderPhone: String(job.senderPhone || ""),
+    storedAt: new Date().toISOString()
+  };
+
+  await redis.set(
+    reactionKeyCacheName(groupId, messageId),
+    JSON.stringify(cachedReference),
+    { EX: REACTION_KEY_CACHE_SECONDS }
+  );
+
+  console.log(
+    "REACTION KEY CACHED:",
+    messageId,
+    "| ttlDays:",
+    REACTION_KEY_CACHE_SECONDS / (60 * 60 * 24)
+  );
+
+  return true;
+}
+
 async function sendReaction(job, emoji) {
   if (!EVOLUTION_API_URL) {
     throw new Error("EVOLUTION_API_URL is missing");
