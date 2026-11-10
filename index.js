@@ -871,6 +871,27 @@ async function worker() {
           result
         );
 
+        /*
+          Pesan FIX/MAU yang baru diterima selalu dimulai sebagai BELUM DAPAT.
+          Kirim 🛒 hanya setelah Apps Script menerima job untuk pertama kali.
+          ALREADY QUEUED sengaja dilewati agar retry/dedup tidak mengirim reaksi
+          yang sama berulang kali. Gagal kirim reaksi juga tidak boleh mengubah
+          atau mengulang order yang sudah diterima.
+        */
+        if (!isCancellation && result === "QUEUED") {
+          try {
+            await sendReaction(job, "🛒");
+            console.log("PENDING REACTION SENT:", job.messageId, "| 🛒");
+          } catch (reactionError) {
+            console.error(
+              "PENDING REACTION ERROR:",
+              job.messageId,
+              "|",
+              reactionError.message
+            );
+          }
+        }
+
       } catch (bridgeError) {
         console.error(
           "SHEET BRIDGE ERROR:",
