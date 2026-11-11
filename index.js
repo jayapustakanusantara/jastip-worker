@@ -52,6 +52,11 @@ const SPIKE_HISTORY_LIMIT = 20;
 const QUEUE_NAME = "jastip:queue";
 const PROCESSING_QUEUE = "jastip:processing";
 const DEAD_QUEUE = "jastip:dead";
+
+// Key WhatsApp asli untuk update reaction setelah admin menyimpan pembagian.
+// TTL terbatas agar Redis tidak menjadi arsip chat permanen.
+const REACTION_KEY_CACHE_SECONDS = 60 * 60 * 24 * 30;
+const REACTION_KEY_CACHE_PREFIX = "jastip:reaction-key:";
 const BBW_GROUP_ID = "120363414084709085@g.us";
 
 const SUPPORTED_GROUPS = new Set([
@@ -79,8 +84,51 @@ app.get("/", (req, res) => {
     redis: redis.isReady,
     appsScriptConfigured: Boolean(APPS_SCRIPT_URL),
     workerSecretConfigured: Boolean(WORKER_SECRET),
-    evolutionConfigured: Boolean(EVOLUTION_API_URL && EVOLUTION_API_KEY)
+    evolutionConfigured: Boolean(EVOLUTION_API_URL && EVOLUTION_API_KEY),
+    reactionSyncConfigured: Boolean(process.env.REACTION_SYNC_SECRET)
   });
+});
+
+/* Internal-only allocation reaction endpoint. */
+app.post("/internal/allocation-reaction", async (req, res) => {
+  const crypto = require("node:crypto");
+  const secret = String(process.env.REACTION_SYNC_SECRET || "");
+  const supplied = String(req.get("x-reaction-sync-secret") || "");
+  if (!secret || !supplied || Buffer.byteLength(secret) !== Buffer.byteLength(supplied) || !crypto.timingSafeEqual(Buffer.from(secret), Buffer.from(supplied))) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+  const groupId = String(req.body?.groupId || "").trim();
+  const messageId = String(req.body?.messageId || "").trim();
+  const emoji = String(req.body?.reaction || "").trim();
+  const sourceSheet = String(req.body?.sourceSheet || "").trim();
+  const allowedSheets = new Set(["ORDER BBW", "ORDER BBW JOGJA", "ORDER BBW GI", "ORDER LIVE"]);
+  if (!SUPPORTED_GROUPS.has(groupId) || !/^[A-Za-z0-9_:\-]{4,160}$/.test(messageId) || !["🛒", "🟡", "✅"].includes(emoji) || !allowedSheets.has(sourceSheet)) {
+    return res.status(400).json({ ok: false, error: "invalid_reference" });
+  }
+  if (!redis.isReady) return res.status(503).json({ ok: false, error: "redis_unavailable" });
+  const referenceName = reactionKeyCacheName(groupId, messageId);
+  const lastName = referenceName + ":last-reaction";
+  const lockName = referenceName + ":update-lock";
+  const lockValue = crypto.randomUUID();
+  try {
+    const lock = await redis.set(lockName, lockValue, { NX: true, EX: 20 });
+    if (lock !== "OK") return res.status(409).json({ ok: false, error: "reaction_update_busy" });
+    const raw = await redis.get(referenceName);
+    if (!raw) return res.status(404).json({ ok: false, error: "original_key_not_cached" });
+    const key = JSON.parse(raw);
+    if (key.groupId !== groupId || key.messageId !== messageId || !key.participant || !key.instance) return res.status(422).json({ ok: false, error: "invalid_cached_key" });
+    if (await redis.get(lastName) === emoji) return res.json({ ok: true, unchanged: true });
+    await sendReaction({ instance: key.instance, groupId: key.groupId, messageId: key.messageId, participant: key.participant }, emoji);
+    await redis.set(lastName, emoji, { EX: REACTION_KEY_CACHE_SECONDS });
+    console.log("ALLOCATION REACTION SENT:", messageId, "|", emoji);
+    return res.json({ ok: true, updated: true });
+  } catch (err) {
+    console.error("ALLOCATION REACTION ERROR:", err.message);
+    return res.status(502).json({ ok: false, error: "reaction_update_failed" });
+  } finally {
+    try { if (await redis.get(lockName) === lockValue) await redis.del(lockName); }
+    catch (err) { console.error("ALLOCATION REACTION LOCK ERROR:", err.message); }
+  }
 });
 
 app.get("/health", (req, res) => {
@@ -534,6 +582,13 @@ app.post("/", async (req, res) => {
       });
     }
 
+    // Cache only after webhook deduplication; cache failures never block FIX/MAU.
+    try {
+      await cacheReactionKey(job);
+    } catch (cacheError) {
+      console.error("REACTION KEY CACHE ERROR:", messageId, "|", cacheError.message);
+    }
+
     await redis.lPush(
       QUEUE_NAME,
       JSON.stringify(job)
@@ -870,6 +925,17 @@ async function worker() {
           "|",
           result
         );
+
+        // Only new accepted orders get 🛒; retries remain silent.
+        if (!isCancellation && result === "QUEUED") {
+          try {
+            await sendReaction(job, "🛒");
+            await rememberReaction_(job, "🛒");
+            console.log("PENDING REACTION SENT:", job.messageId, "| 🛒");
+          } catch (reactionError) {
+            console.error("PENDING REACTION ERROR:", job.messageId, "|", reactionError.message);
+          }
+        }
 
       } catch (bridgeError) {
         console.error(
@@ -1284,6 +1350,36 @@ async function sendJobToAppsScript(job) {
 /*
   Kirim reaction langsung dari Railway worker ke Evolution API.
 */
+function reactionKeyCacheName(groupId, messageId) {
+  const reference = String(groupId || "") + "\u0000" + String(messageId || "");
+  return REACTION_KEY_CACHE_PREFIX + Buffer.from(reference).toString("base64url");
+}
+
+async function cacheReactionKey(job) {
+  const groupId = String(job?.groupId || "").trim();
+  const messageId = String(job?.messageId || "").trim();
+  const participant = String(job?.participant || job?.rawKey?.participant || "").trim();
+  if (!groupId || !messageId || !participant) {
+    console.warn("REACTION KEY CACHE SKIPPED: incomplete reference |", messageId || "MISSING");
+    return false;
+  }
+  const cachedReference = {
+    version: 1, instance: String(job.instance || "Jastip-bot"), groupId, messageId, participant,
+    participantAlt: String(job.participantAlt || ""), senderPhone: String(job.senderPhone || ""), storedAt: new Date().toISOString()
+  };
+  await redis.set(reactionKeyCacheName(groupId, messageId), JSON.stringify(cachedReference), { EX: REACTION_KEY_CACHE_SECONDS });
+  console.log("REACTION KEY CACHED:", messageId, "| ttlDays:", REACTION_KEY_CACHE_SECONDS / 86400);
+  return true;
+}
+
+async function rememberReaction_(job, emoji) {
+  const groupId = String(job?.groupId || "").trim();
+  const messageId = String(job?.messageId || "").trim();
+  if (!groupId || !messageId) return false;
+  await redis.set(reactionKeyCacheName(groupId, messageId) + ":last-reaction", emoji, { EX: REACTION_KEY_CACHE_SECONDS });
+  return true;
+}
+
 async function sendReaction(job, emoji) {
   if (!EVOLUTION_API_URL) {
     throw new Error("EVOLUTION_API_URL is missing");
