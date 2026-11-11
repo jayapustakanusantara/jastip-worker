@@ -53,6 +53,10 @@ const QUEUE_NAME = "jastip:queue";
 const PROCESSING_QUEUE = "jastip:processing";
 const DEAD_QUEUE = "jastip:dead";
 
+// Reaction hasil pembagian diproses di belakang layar agar Portal cepat.
+const ALLOCATION_REACTION_QUEUE = "jastip:allocation-reaction:queue";
+const ALLOCATION_REACTION_PENDING_SECONDS = 60 * 10;
+
 // Key WhatsApp asli untuk update reaction setelah admin menyimpan pembagian.
 // TTL terbatas agar Redis tidak menjadi arsip chat permanen.
 const REACTION_KEY_CACHE_SECONDS = 60 * 60 * 24 * 30;
@@ -89,7 +93,11 @@ app.get("/", (req, res) => {
   });
 });
 
-/* Internal-only allocation reaction endpoint. */
+/*
+  Internal-only allocation reaction endpoint.
+  Endpoint hanya menaruh status terbaru ke Redis; Evolution diproses oleh
+  worker khusus agar SIMPAN PEMBAGIAN tidak ikut menunggu WhatsApp.
+*/
 app.post("/internal/allocation-reaction", async (req, res) => {
   const crypto = require("node:crypto");
   const secret = String(process.env.REACTION_SYNC_SECRET || "");
@@ -107,27 +115,26 @@ app.post("/internal/allocation-reaction", async (req, res) => {
   }
   if (!redis.isReady) return res.status(503).json({ ok: false, error: "redis_unavailable" });
   const referenceName = reactionKeyCacheName(groupId, messageId);
-  const lastName = referenceName + ":last-reaction";
-  const lockName = referenceName + ":update-lock";
-  const lockValue = crypto.randomUUID();
+  const pendingName = referenceName + ":pending-allocation-reaction";
   try {
-    const lock = await redis.set(lockName, lockValue, { NX: true, EX: 20 });
-    if (lock !== "OK") return res.status(409).json({ ok: false, error: "reaction_update_busy" });
     const raw = await redis.get(referenceName);
     if (!raw) return res.status(404).json({ ok: false, error: "original_key_not_cached" });
     const key = JSON.parse(raw);
     if (key.groupId !== groupId || key.messageId !== messageId || !key.participant || !key.instance) return res.status(422).json({ ok: false, error: "invalid_cached_key" });
-    if (await redis.get(lastName) === emoji) return res.json({ ok: true, unchanged: true });
-    await sendReaction({ instance: key.instance, groupId: key.groupId, messageId: key.messageId, participant: key.participant }, emoji);
-    await redis.set(lastName, emoji, { EX: REACTION_KEY_CACHE_SECONDS });
-    console.log("ALLOCATION REACTION SENT:", messageId, "|", emoji);
-    return res.json({ ok: true, updated: true });
+    // Last-write-wins: dua admin dapat menyimpan berdekatan tanpa reaction
+    // dobel atau status WhatsApp yang tertinggal.
+    await redis.set(
+      pendingName,
+      JSON.stringify({ groupId, messageId, emoji, queuedAt: new Date().toISOString() }),
+      { EX: ALLOCATION_REACTION_PENDING_SECONDS }
+    );
+    // Job kecil boleh lebih dari satu untuk Message ID yang sama. Worker
+    // membaca pending key yang sama dan mengirim status terakhir sekali saja.
+    await redis.rPush(ALLOCATION_REACTION_QUEUE, referenceName);
+    return res.status(202).json({ ok: true, queued: true });
   } catch (err) {
-    console.error("ALLOCATION REACTION ERROR:", err.message);
-    return res.status(502).json({ ok: false, error: "reaction_update_failed" });
-  } finally {
-    try { if (await redis.get(lockName) === lockValue) await redis.del(lockName); }
-    catch (err) { console.error("ALLOCATION REACTION LOCK ERROR:", err.message); }
+    console.error("ALLOCATION REACTION QUEUE ERROR:", err.message);
+    return res.status(502).json({ ok: false, error: "reaction_queue_failed" });
   }
 });
 
@@ -1045,6 +1052,74 @@ async function worker() {
   }
 }
 
+/*
+  Worker terpisah untuk reaction hasil SIMPAN PEMBAGIAN.
+  Tidak memakai antrean order utama agar retry Evolution tidak menghambat
+  pencatatan FIX/MAU ke Google Sheets.
+*/
+async function allocationReactionWorker() {
+  console.log("Allocation reaction worker started...");
+
+  while (true) {
+    let referenceName = "";
+    try {
+      const popped = await redis.blPop(ALLOCATION_REACTION_QUEUE, 5);
+      referenceName = String(popped?.element || "");
+      if (!referenceName) continue;
+
+      const pendingName = referenceName + ":pending-allocation-reaction";
+      const rawPending = await redis.get(pendingName);
+      if (!rawPending) continue; // Job lama, sudah digantikan/selesai.
+
+      let pending;
+      try {
+        pending = JSON.parse(rawPending);
+      } catch (err) {
+        console.error("ALLOCATION REACTION INVALID JOB:", referenceName);
+        await redis.del(pendingName);
+        continue;
+      }
+
+      const result = await processAllocationReaction_(pending);
+      const latest = await redis.get(pendingName);
+
+      if (latest === rawPending) {
+        await redis.del(pendingName);
+        console.log(
+          "ALLOCATION REACTION DONE:",
+          pending.messageId,
+          "|",
+          pending.emoji,
+          "|",
+          result
+        );
+      } else if (latest) {
+        // Ada save yang lebih baru saat Evolution sedang diproses.
+        await redis.rPush(ALLOCATION_REACTION_QUEUE, referenceName);
+      }
+    } catch (err) {
+      const nonRetryable = new Set([
+        "original_key_not_cached",
+        "invalid_cached_key"
+      ]);
+      console.error(
+        "ALLOCATION REACTION WORKER ERROR:",
+        referenceName || "NO_JOB",
+        "|",
+        err.message
+      );
+      // Pending status tetap disimpan; retry tidak pernah membatalkan
+      // pembagian buku yang sudah tersimpan di Google Sheets.
+      if (referenceName && nonRetryable.has(String(err.message || ""))) {
+        await redis.del(referenceName + ":pending-allocation-reaction");
+      } else if (referenceName) {
+        await redis.rPush(ALLOCATION_REACTION_QUEUE, referenceName);
+      }
+      await sleep(1000);
+    }
+  }
+}
+
 
 /*
   VALIDASI AWAL ORDER
@@ -1378,6 +1453,48 @@ async function rememberReaction_(job, emoji) {
   if (!groupId || !messageId) return false;
   await redis.set(reactionKeyCacheName(groupId, messageId) + ":last-reaction", emoji, { EX: REACTION_KEY_CACHE_SECONDS });
   return true;
+}
+
+async function processAllocationReaction_(pending) {
+  const groupId = String(pending?.groupId || "").trim();
+  const messageId = String(pending?.messageId || "").trim();
+  const emoji = String(pending?.emoji || "").trim();
+  const referenceName = reactionKeyCacheName(groupId, messageId);
+  const lastName = referenceName + ":last-reaction";
+  const lockName = referenceName + ":update-lock";
+  const lockValue = require("node:crypto").randomUUID();
+
+  const lock = await redis.set(lockName, lockValue, { NX: true, EX: 20 });
+  if (lock !== "OK") {
+    throw new Error("reaction_update_busy");
+  }
+
+  try {
+    const raw = await redis.get(referenceName);
+    if (!raw) throw new Error("original_key_not_cached");
+
+    const key = JSON.parse(raw);
+    if (key.groupId !== groupId || key.messageId !== messageId || !key.participant || !key.instance) {
+      throw new Error("invalid_cached_key");
+    }
+
+    if (await redis.get(lastName) === emoji) return "unchanged";
+
+    await sendReaction({
+      instance: key.instance,
+      groupId: key.groupId,
+      messageId: key.messageId,
+      participant: key.participant
+    }, emoji);
+    await redis.set(lastName, emoji, { EX: REACTION_KEY_CACHE_SECONDS });
+    return "updated";
+  } finally {
+    try {
+      if (await redis.get(lockName) === lockValue) await redis.del(lockName);
+    } catch (err) {
+      console.error("ALLOCATION REACTION LOCK ERROR:", err.message);
+    }
+  }
 }
 
 async function sendReaction(job, emoji) {
@@ -2059,6 +2176,13 @@ async function start() {
       err
     );
 
+    process.exit(1);
+  });
+
+  // Dipisahkan dari worker FIX/MAU supaya masalah Evolution tidak membuat
+  // order baru berhenti dicatat ke Google Sheets.
+  allocationReactionWorker().catch((err) => {
+    console.error("FATAL ALLOCATION REACTION WORKER ERROR:", err);
     process.exit(1);
   });
 }
