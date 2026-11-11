@@ -2299,27 +2299,39 @@ function traceParticipantIds_(candidate, key) {
   return [key && key.participant, key && key.participantAlt, candidate && candidate.participant, candidate && candidate.participantAlt, nested && nested.participant, nested && nested.participantAlt].filter(Boolean).map(String);
 }
 
+// Google Sheet menambahkan "-1", "-2", dan seterusnya pada Message ID supaya
+// satu chat yang memesan beberapa judul mempunyai row ID yang unik. Itu bukan
+// bagian dari key WhatsApp asli. Lookup tetap mencoba nilai yang tersimpan dulu,
+// lalu fallback ke raw key tanpa suffix item. Dengan begitu message key asli
+// tetap wajib cocok dan quote tidak pernah dibuat dari teks palsu.
+function traceLookupMessageIds_(messageId) {
+  const stored = String(messageId || "").trim();
+  const raw = stored.replace(/-\d+$/, "");
+  return raw && raw !== stored ? [stored, raw] : [stored];
+}
+
 async function findOriginalEvolutionMessage_(request) {
   if (!EVOLUTION_API_URL || !EVOLUTION_API_KEY) throw new Error("Original WhatsApp message not available for native quote.");
   const endpoint = String(EVOLUTION_API_URL).replace(/\/+$/, "") + "/chat/findMessages/" + encodeURIComponent(request.instance);
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: { "content-type": "application/json", apikey: EVOLUTION_API_KEY },
-    body: JSON.stringify({ where: { key: { remoteJid: request.groupId, fromMe: false, id: request.messageId } }, limit: 1 })
-  });
-  if (!response.ok) {
-    if (response.status === 404) throw new Error("Original WhatsApp message not available for native quote.");
-    throw new Error("Evolution message lookup HTTP " + response.status);
+  for (const lookupMessageId of traceLookupMessageIds_(request.messageId)) {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", apikey: EVOLUTION_API_KEY },
+      body: JSON.stringify({ where: { key: { remoteJid: request.groupId, fromMe: false, id: lookupMessageId } }, limit: 1 })
+    });
+    if (!response.ok) {
+      if (response.status === 404) continue;
+      throw new Error("Evolution message lookup HTTP " + response.status);
+    }
+    const candidate = traceCandidate_(await response.json());
+    const key = candidate && (candidate.key || (candidate.message && candidate.message.key));
+    const message = candidate && (candidate.message || candidate);
+    if (!key || !message || key.id !== lookupMessageId || key.remoteJid !== request.groupId || key.fromMe === true) continue;
+    const phones = traceParticipantIds_(candidate, key).filter((id) => /^(?:0|62)\d{8,15}(?:@|$)/.test(id)).map(normalizeTracePhone_);
+    if (phones.length && !phones.includes(request.customerPhone)) continue;
+    return { key, message };
   }
-  const candidate = traceCandidate_(await response.json());
-  const key = candidate && (candidate.key || (candidate.message && candidate.message.key));
-  const message = candidate && (candidate.message || candidate);
-  if (!key || !message || key.id !== request.messageId || key.remoteJid !== request.groupId || key.fromMe === true) {
-    throw new Error("Original WhatsApp message not available for native quote.");
-  }
-  const phones = traceParticipantIds_(candidate, key).filter((id) => /^(?:0|62)\d{8,15}(?:@|$)/.test(id)).map(normalizeTracePhone_);
-  if (phones.length && !phones.includes(request.customerPhone)) throw new Error("Original WhatsApp message not available for native quote.");
-  return { key, message };
+  throw new Error("Original WhatsApp message not available for native quote.");
 }
 
 async function sendNativePrivateQuote_(request, original) {
