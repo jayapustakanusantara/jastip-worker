@@ -25,6 +25,8 @@ const TRACE_PORTAL_SECRET =
 const TRACE_SOURCE_GROUPS_JSON = process.env.TRACE_SOURCE_GROUPS_JSON || "";
 const TRACE_REPLY_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 const TRACE_REPLY_INSTANCE = process.env.TRACE_REPLY_INSTANCE || "Jastip-bot";
+const TRACE_MESSAGE_CACHE_SECONDS = Math.floor(TRACE_REPLY_MAX_AGE_MS / 1000);
+const TRACE_MESSAGE_CACHE_PREFIX = "jastip:trace-message:";
 
 
 // =====================================================
@@ -573,7 +575,10 @@ app.post("/", async (req, res) => {
       quotedProduct,
       mentionJid,
 
-      rawKey: key
+      rawKey: key,
+      // Salinan payload asli untuk native quote. Disimpan terbatas 14 hari
+      // hanya setelah FIX/MAU lolos deduplication.
+      rawMessage: message
     };
 
     /*
@@ -606,6 +611,12 @@ app.post("/", async (req, res) => {
       await cacheReactionKey(job);
     } catch (cacheError) {
       console.error("REACTION KEY CACHE ERROR:", messageId, "|", cacheError.message);
+    }
+    try {
+      await cacheTraceOriginalMessage(job);
+    } catch (cacheError) {
+      // Cache TRACE bersifat tambahan; FIX/MAU tidak boleh gagal bila Redis cache bermasalah.
+      console.error("TRACE MESSAGE CACHE ERROR:", messageId, "|", cacheError.message);
     }
 
     await redis.lPush(
@@ -1440,6 +1451,29 @@ async function sendJobToAppsScript(job) {
 function reactionKeyCacheName(groupId, messageId) {
   const reference = String(groupId || "") + "\u0000" + String(messageId || "");
   return REACTION_KEY_CACHE_PREFIX + Buffer.from(reference).toString("base64url");
+}
+
+function traceMessageCacheName(groupId, messageId) {
+  const reference = String(groupId || "") + "\u0000" + String(messageId || "");
+  return TRACE_MESSAGE_CACHE_PREFIX + Buffer.from(reference).toString("base64url");
+}
+
+async function cacheTraceOriginalMessage(job) {
+  const key = job?.rawKey;
+  const message = job?.rawMessage;
+  const groupId = String(job?.groupId || key?.remoteJid || "").trim();
+  const messageId = String(job?.messageId || key?.id || "").trim();
+  if (!groupId || !messageId || !key || typeof key !== "object" || !message || typeof message !== "object") {
+    console.warn("TRACE MESSAGE CACHE SKIPPED: incomplete original |", messageId || "MISSING");
+    return false;
+  }
+  await redis.set(
+    traceMessageCacheName(groupId, messageId),
+    JSON.stringify({ version: 1, storedAt: new Date().toISOString(), key, message }),
+    { EX: TRACE_MESSAGE_CACHE_SECONDS }
+  );
+  console.log("TRACE MESSAGE CACHED:", messageId, "| ttlDays:", TRACE_MESSAGE_CACHE_SECONDS / 86400);
+  return true;
 }
 
 async function cacheReactionKey(job) {
@@ -2310,8 +2344,33 @@ function traceLookupMessageIds_(messageId) {
   return raw && raw !== stored ? [stored, raw] : [stored];
 }
 
+function isValidTraceOriginal_(candidate, request, lookupMessageId) {
+  const key = candidate && candidate.key;
+  const message = candidate && candidate.message;
+  if (!key || !message || key.id !== lookupMessageId || key.remoteJid !== request.groupId || key.fromMe === true) return false;
+  const phones = traceParticipantIds_(candidate, key)
+    .filter((id) => /^(?:0|62)\d{8,15}(?:@|$)/.test(id))
+    .map(normalizeTracePhone_);
+  return !phones.length || phones.includes(request.customerPhone);
+}
+
+async function findCachedTraceOriginalMessage_(request) {
+  for (const lookupMessageId of traceLookupMessageIds_(request.messageId)) {
+    const raw = await redis.get(traceMessageCacheName(request.groupId, lookupMessageId));
+    if (!raw) continue;
+    let candidate;
+    try { candidate = JSON.parse(raw); } catch { continue; }
+    if (isValidTraceOriginal_(candidate, request, lookupMessageId)) return candidate;
+  }
+  return null;
+}
+
 async function findOriginalEvolutionMessage_(request) {
   if (!EVOLUTION_API_URL || !EVOLUTION_API_KEY) throw new Error("Original WhatsApp message not available for native quote.");
+  // Evolution message database tidak selalu menyimpan incoming payload. Prioritaskan
+  // cache payload asli yang Worker terima, lalu gunakan lookup Evolution sebagai fallback.
+  const cached = await findCachedTraceOriginalMessage_(request);
+  if (cached) return cached;
   const endpoint = String(EVOLUTION_API_URL).replace(/\/+$/, "") + "/chat/findMessages/" + encodeURIComponent(request.instance);
   for (const lookupMessageId of traceLookupMessageIds_(request.messageId)) {
     const response = await fetch(endpoint, {
@@ -2326,9 +2385,7 @@ async function findOriginalEvolutionMessage_(request) {
     const candidate = traceCandidate_(await response.json());
     const key = candidate && (candidate.key || (candidate.message && candidate.message.key));
     const message = candidate && (candidate.message || candidate);
-    if (!key || !message || key.id !== lookupMessageId || key.remoteJid !== request.groupId || key.fromMe === true) continue;
-    const phones = traceParticipantIds_(candidate, key).filter((id) => /^(?:0|62)\d{8,15}(?:@|$)/.test(id)).map(normalizeTracePhone_);
-    if (phones.length && !phones.includes(request.customerPhone)) continue;
+    if (!isValidTraceOriginal_({ key, message, participant: candidate?.participant, participantAlt: candidate?.participantAlt }, request, lookupMessageId)) continue;
     return { key, message };
   }
   throw new Error("Original WhatsApp message not available for native quote.");
