@@ -28,6 +28,17 @@ const TRACE_REPLY_INSTANCE = process.env.TRACE_REPLY_INSTANCE || "Jastip-bot";
 const TRACE_MESSAGE_CACHE_SECONDS = Math.floor(TRACE_REPLY_MAX_AGE_MS / 1000);
 const TRACE_MESSAGE_CACHE_PREFIX = "jastip:trace-message:";
 
+// PRIVATE REKAP REQUEST
+// Jalur ini hanya untuk chat pribadi customer yang menulis command rekap.
+// Tidak memakai queue FIX/MAU dan tidak pernah membaca / mengubah order langsung.
+// Link tetap dibuat oleh Web App Rekapan yang sudah dipakai Portal Admin.
+const RECAP_WEB_APP_URL = String(process.env.RECAP_WEB_APP_URL || "").trim();
+const RECAP_API_KEY = String(process.env.RECAP_API_KEY || "").trim();
+const RECAP_INSTANCE = String(process.env.RECAP_INSTANCE || TRACE_REPLY_INSTANCE || "Jastip-bot").trim();
+const PRIVATE_RECAP_QUEUE = "jastip:private-recap:queue";
+const PRIVATE_RECAP_SEEN_PREFIX = "jastip:private-recap:seen:";
+const PRIVATE_RECAP_SEEN_SECONDS = 60 * 60 * 24 * 7;
+
 
 // =====================================================
 // EVOLUTION / RAILWAY SPIKE MONITOR
@@ -103,7 +114,8 @@ app.get("/", (req, res) => {
     appsScriptConfigured: Boolean(APPS_SCRIPT_URL),
     workerSecretConfigured: Boolean(WORKER_SECRET),
     evolutionConfigured: Boolean(EVOLUTION_API_URL && EVOLUTION_API_KEY),
-    reactionSyncConfigured: Boolean(process.env.REACTION_SYNC_SECRET)
+    reactionSyncConfigured: Boolean(process.env.REACTION_SYNC_SECRET),
+    privateRecapConfigured: Boolean(RECAP_WEB_APP_URL && RECAP_API_KEY)
   });
 });
 
@@ -393,6 +405,51 @@ app.post("/", async (req, res) => {
         "| group:",
         remoteJid || "MISSING"
       );
+    }
+
+    /*
+      CHAT PRIBADI: customer boleh meminta link rekap ulang dengan command
+      persis "rekap bbw", "rekap bbw jogja", atau "rekap bbw gi".
+      Ini diproses SEBELUM guard grup karena direct chat tidak mempunyai
+      Group ID @g.us. Semua chat lain tetap diabaikan seperti sebelumnya.
+    */
+    if (isOrderEvent && !fromMe && !String(remoteJid || "").endsWith("@g.us")) {
+      const privateText = extractMessageText(message);
+      const recapRequest = parsePrivateRecapCommand_(privateText);
+
+      if (recapRequest) {
+        const customerPhone = privateChatPhone_(
+          remoteJid,
+          data.participantAlt || data.participant || outerKey.participantAlt || outerKey.participant || ""
+        );
+        if (!messageId || !customerPhone) {
+          console.warn("PRIVATE RECAP IGNORED: missing message ID or customer phone");
+          return res.status(200).json({ ok: true, ignored: true, reason: "private recap sender unavailable" });
+        }
+
+        const firstRequest = await redis.set(
+          PRIVATE_RECAP_SEEN_PREFIX + messageId,
+          "1",
+          { NX: true, EX: PRIVATE_RECAP_SEEN_SECONDS }
+        );
+
+        if (!firstRequest) {
+          return res.status(200).json({ ok: true, duplicate: true, action: "PRIVATE_RECAP" });
+        }
+
+        await redis.rPush(PRIVATE_RECAP_QUEUE, JSON.stringify({
+          messageId,
+          instance: String(instance || RECAP_INSTANCE),
+          customerPhone,
+          recapType: recapRequest.recapType,
+          sourceSheet: recapRequest.sourceSheet,
+          eventLabel: recapRequest.eventLabel,
+          receivedAt: new Date().toISOString()
+        }));
+
+        console.log("PRIVATE RECAP QUEUED:", recapRequest.recapType, "|", customerPhone);
+        return res.status(200).json({ ok: true, queued: true, action: "PRIVATE_RECAP" });
+      }
     }
 
     if (!SUPPORTED_GROUPS.has(remoteJid)) {
@@ -1775,6 +1832,189 @@ function extractMessageText(message) {
 }
 
 
+// =====================================================
+// PRIVATE REKAP COMMAND — "rekap bbw", "rekap bbw jogja", "rekap bbw gi"
+// =====================================================
+function parsePrivateRecapCommand_(text) {
+  const normalized = String(text || "")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, " ");
+
+  const commands = {
+    "rekap bbw": {
+      recapType: "BBW",
+      sourceSheet: "ORDER BBW",
+      eventLabel: "BBW"
+    },
+    "rekap bbw sekarang": {
+      recapType: "BBW",
+      sourceSheet: "ORDER BBW",
+      eventLabel: "BBW"
+    },
+    "rekap bbw jogja": {
+      recapType: "BBW_JOGJA",
+      sourceSheet: "ORDER BBW JOGJA",
+      eventLabel: "BBW Jogja"
+    },
+    "rekap bbw gi": {
+      recapType: "BBW_GI",
+      sourceSheet: "ORDER BBW GI",
+      eventLabel: "BBW GI"
+    }
+  };
+
+  return commands[normalized] || null;
+}
+
+function privateChatPhone_(remoteJid, fallback) {
+  const source = String(remoteJid || fallback || "").trim();
+  const bare = source.replace(/@.+$/, "").replace(/\D/g, "");
+  const phone = bare.replace(/^0/, "62");
+  return /^62\d{8,15}$/.test(phone) ? phone : "";
+}
+
+function privateRecapReplyText_(job, data) {
+  const eventLabel = String(job.eventLabel || "BBW");
+  const name = String(data?.customerName || "").trim();
+  const link = String(data?.link || "").trim();
+  const greeting = name ? `Hai kak ${name},` : "Hai kak,";
+
+  return [
+    `📚 REKAP ORDER ${eventLabel.toUpperCase()}`,
+    "",
+    greeting,
+    `Ini link rekapan order ${eventLabel} kak:`,
+    link,
+    "",
+    "Link berlaku 7 hari ya kak 😊"
+  ].join("\n");
+}
+
+function privateRecapNotFoundText_(job) {
+  return [
+    `Maaf kak, data order ${String(job.eventLabel || "BBW")} untuk nomor WhatsApp ini belum ditemukan.`,
+    "Pastikan nomor yang dipakai sama dengan nomor saat FIX ya 😊"
+  ].join("\n");
+}
+
+async function requestPrivateRecapLink_(job) {
+  if (!RECAP_WEB_APP_URL || !RECAP_API_KEY) {
+    throw new Error("private_recap_not_configured");
+  }
+
+  const endpoint = RECAP_WEB_APP_URL.replace(/\/+$/, "");
+  const body = JSON.stringify({
+    action: "generate_link_only",
+    apiKey: RECAP_API_KEY,
+    phone: job.customerPhone,
+    recapType: job.recapType,
+    sourceSheet: job.sourceSheet
+  });
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        redirect: "follow",
+        signal: controller.signal
+      });
+      const text = await response.text();
+
+      // Google Apps Script kadang memberi 404 sesaat tepat setelah redirect.
+      if (response.status === 404 && attempt < 3) {
+        await sleep(attempt * 700);
+        continue;
+      }
+
+      if (!response.ok) {
+        throw new Error(`recap_http_${response.status}`);
+      }
+
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (_) {
+        throw new Error("recap_invalid_response");
+      }
+      if (!data || data.success !== true) {
+        throw new Error(data?.message || "recap_rejected");
+      }
+      return data;
+    } catch (err) {
+      lastError = err;
+      if (attempt < 3 && (err?.name === "AbortError" || String(err.message || "").startsWith("recap_http_5"))) {
+        await sleep(attempt * 700);
+        continue;
+      }
+      break;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  throw lastError || new Error("recap_request_failed");
+}
+
+async function sendPrivateRecapText_(job, text) {
+  if (!EVOLUTION_API_URL || !EVOLUTION_API_KEY) {
+    throw new Error("evolution_not_configured");
+  }
+
+  const endpoint = String(EVOLUTION_API_URL).replace(/\/+$/, "") +
+    "/message/sendText/" + encodeURIComponent(String(job.instance || RECAP_INSTANCE));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", apikey: EVOLUTION_API_KEY },
+      body: JSON.stringify({ number: job.customerPhone, text }),
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`evolution_send_http_${response.status}`);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function privateRecapWorker() {
+  console.log("Private recap worker started...");
+
+  while (true) {
+    try {
+      const popped = await redis.blPop(PRIVATE_RECAP_QUEUE, 5);
+      const raw = String(popped?.element || "");
+      if (!raw) continue;
+
+      let job;
+      try {
+        job = JSON.parse(raw);
+      } catch (_) {
+        console.error("PRIVATE RECAP INVALID JOB");
+        continue;
+      }
+
+      const data = await requestPrivateRecapLink_(job);
+      const reply = data.found === false
+        ? privateRecapNotFoundText_(job)
+        : privateRecapReplyText_(job, data);
+      await sendPrivateRecapText_(job, reply);
+      console.log("PRIVATE RECAP SENT:", job.recapType, "|", job.customerPhone);
+    } catch (err) {
+      // Tidak pernah memasukkan ulang ke queue utama / queue FIX. Customer
+      // bisa mengirim command lagi bila layanan rekap sedang tidak tersedia.
+      console.error("PRIVATE RECAP WORKER ERROR:", err.message);
+      await sleep(1000);
+    }
+  }
+}
+
+
 function extractQuotedProduct(message, dataContextInfo) {
   try {
     const nestedCtx =
@@ -2229,6 +2469,13 @@ async function start() {
   // order baru berhenti dicatat ke Google Sheets.
   allocationReactionWorker().catch((err) => {
     console.error("FATAL ALLOCATION REACTION WORKER ERROR:", err);
+    process.exit(1);
+  });
+
+  // Dipisahkan dari order queue: request rekap private tidak boleh menunda
+  // pencatatan FIX/MAU bila Web App Rekapan sedang lambat.
+  privateRecapWorker().catch((err) => {
+    console.error("FATAL PRIVATE RECAP WORKER ERROR:", err);
     process.exit(1);
   });
 }
