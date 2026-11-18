@@ -94,6 +94,13 @@ const SUPPORTED_GROUPS = new Set([
   "120363414084709085@g.us"  // ORDER BBW
 ]);
 
+// Grup ORDER menerima konfirmasi langsung setelah FIX/MAU berhasil dicatat.
+// Grup BBW dan LIVE tetap memakai 🛒 sampai ada pembagian buku.
+// Dipisahkan dari aturan validasi/pembagian supaya hanya reaction awal yang berubah.
+const DIRECT_CONFIRMED_REACTION_GROUPS = new Set([
+  "120363214326633370@g.us"
+]);
+
 const redis = createClient({
   url: REDIS_URL
 });
@@ -691,6 +698,7 @@ app.post("/", async (req, res) => {
     );
 
     /*
+
       RETURN CEPAT KE EVOLUTION.
       Jangan proses Google Sheet / reaction di webhook.
     */
@@ -1013,14 +1021,18 @@ async function worker() {
           result
         );
 
-        // Only new accepted orders get 🛒; retries remain silent.
+        // Only new accepted orders get an initial reaction; retries remain silent.
+        // ORDER langsung ✅, sementara BBW/LIVE tetap 🛒 sampai pembagian dilakukan.
         if (!isCancellation && result === "QUEUED") {
           try {
-            await sendReaction(job, "🛒");
-            await rememberReaction_(job, "🛒");
-            console.log("PENDING REACTION SENT:", job.messageId, "| 🛒");
+            const initialReaction = DIRECT_CONFIRMED_REACTION_GROUPS.has(job.groupId)
+              ? "✅"
+              : "🛒";
+            await sendReaction(job, initialReaction);
+            await rememberReaction_(job, initialReaction);
+            console.log("INITIAL REACTION SENT:", job.messageId, "|", initialReaction);
           } catch (reactionError) {
-            console.error("PENDING REACTION ERROR:", job.messageId, "|", reactionError.message);
+            console.error("INITIAL REACTION ERROR:", job.messageId, "|", reactionError.message);
           }
         }
 
@@ -1387,6 +1399,7 @@ async function sendJobToAppsScript(job) {
   }
 
   const isCancellation =
+
     job.action === "CANCEL_DELETED_MESSAGE";
 
   const payload = {
@@ -2087,6 +2100,7 @@ function extractMentionJid(message, dataContextInfo) {
       message?.imageMessage?.contextInfo ||
       message?.videoMessage?.contextInfo ||
       message?.documentMessage?.contextInfo ||
+
       {};
 
     const mentioned =
