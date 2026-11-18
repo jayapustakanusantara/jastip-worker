@@ -82,11 +82,34 @@ const DEAD_QUEUE = "jastip:dead";
 const ALLOCATION_REACTION_QUEUE = "jastip:allocation-reaction:queue";
 const ALLOCATION_REACTION_PENDING_SECONDS = 60 * 10;
 
+// Reaction awal dipisahkan dari antrean order agar Evolution yang lambat/offline
+// tidak pernah menunda pencatatan FIX/MAU ke Google Sheets.
+const INITIAL_REACTION_QUEUE = "jastip:initial-reaction:queue";
+const INITIAL_REACTION_PENDING_SECONDS = 60 * 15;
+const INITIAL_REACTION_MAX_RETRIES = 2;
+const INITIAL_REACTION_RETRY_DELAY_MS = 750;
+const INITIAL_REACTION_FAILED_QUEUE = "jastip:initial-reaction:failed";
+const INITIAL_REACTION_FAILED_TTL_SECONDS = 60 * 60 * 24 * 7;
+// Index ini memastikan job reaction yang sudah di-pop tetapi worker restart
+// tetap bisa dimasukkan kembali saat startup. Data order tidak ikut disentuh.
+const INITIAL_REACTION_PENDING_INDEX = "jastip:initial-reaction:pending-index";
+
 // Key WhatsApp asli untuk update reaction setelah admin menyimpan pembagian.
 // TTL terbatas agar Redis tidak menjadi arsip chat permanen.
 const REACTION_KEY_CACHE_SECONDS = 60 * 60 * 24 * 30;
 const REACTION_KEY_CACHE_PREFIX = "jastip:reaction-key:";
 const BBW_GROUP_ID = "120363414084709085@g.us";
+const BOOK_SQUAD_GROUP_ID = "120363214326633370@g.us"; // ORDER
+const DELETED_ORDER_TTL_SECONDS = 60 * 60 * 24 * 7;
+function deletedOrderKey(groupId, messageId) {
+  return `jastip:deleted-order:${groupId}:${messageId}`;
+}
+async function isDeletedOrder(job) {
+  return job?.action !== "CANCEL_DELETED_MESSAGE" &&
+    job?.groupId === BOOK_SQUAD_GROUP_ID &&
+    Boolean(await redis.exists(deletedOrderKey(job.groupId, job.messageId)));
+}
+
 
 const SUPPORTED_GROUPS = new Set([
   "120363214326633370@g.us", // ORDER
@@ -147,6 +170,9 @@ app.post("/internal/allocation-reaction", async (req, res) => {
     return res.status(400).json({ ok: false, error: "invalid_reference" });
   }
   if (!redis.isReady) return res.status(503).json({ ok: false, error: "redis_unavailable" });
+  if (groupId === BOOK_SQUAD_GROUP_ID && await redis.exists(deletedOrderKey(groupId, messageId))) {
+    return res.status(410).json({ ok: false, error: "original_message_deleted" });
+  }
   const referenceName = reactionKeyCacheName(groupId, messageId);
   const pendingName = referenceName + ":pending-allocation-reaction";
   try {
@@ -520,7 +546,7 @@ app.post("/", async (req, res) => {
     */
     if (isCancellationEvent) {
       // Fitur batal karena Delete for Everyone hanya berlaku di grup BBW.
-      if (remoteJid !== BBW_GROUP_ID) {
+      if (remoteJid !== BBW_GROUP_ID && remoteJid !== BOOK_SQUAD_GROUP_ID) {
         return res.status(200).json({
           ok: true,
           ignored: true,
@@ -530,8 +556,15 @@ app.post("/", async (req, res) => {
         });
       }
 
+      // Mark deletion before queueing cancellation: the FIX may still be waiting.
+      // The marker also suppresses reactions to a message WhatsApp no longer has.
+      if (remoteJid === BOOK_SQUAD_GROUP_ID) {
+        await redis.set(deletedOrderKey(remoteJid, messageId), "1", { EX: DELETED_ORDER_TTL_SECONDS });
+        await redis.del(reactionKeyCacheName(remoteJid, messageId) + ":pending-allocation-reaction");
+      }
+
       const deleteSeenKey =
-        `jastip:delete-seen:${messageId}`;
+        `jastip:delete-seen:${remoteJid}:${messageId}`;
 
       const firstDelete = await redis.set(
         deleteSeenKey,
@@ -649,7 +682,9 @@ app.post("/", async (req, res) => {
       Anti duplicate message ID.
       Evolution bisa retry webhook yang sama.
     */
-    const seenKey = `jastip:seen:${messageId}`;
+    // Message ID WhatsApp hanya unik dalam konteks chat/group. Gunakan keduanya
+    // agar webhook dari grup berbeda tidak saling dianggap duplikat.
+    const seenKey = `jastip:seen:${remoteJid}:${messageId}`;
 
     const firstTime = await redis.set(
       seenKey,
@@ -733,7 +768,8 @@ app.post("/queue", async (req, res) => {
       });
     }
 
-    const seenKey = `jastip:seen:${payload.messageId}`;
+    const queueGroupId = String(payload.groupId || "manual").trim();
+    const seenKey = `jastip:seen:${queueGroupId}:${payload.messageId}`;
 
     const firstTime = await redis.set(
       seenKey,
@@ -957,6 +993,14 @@ async function worker() {
       const isCancellation =
         job.action === "CANCEL_DELETED_MESSAGE";
 
+      // A deleted BOOK SQUAD FIX must never be written after its delete event.
+      // Cancellation job stays queued separately to clean up any saved rows.
+      if (await isDeletedOrder(job)) {
+        await redis.lRem(PROCESSING_QUEUE, 1, rawJob);
+        console.log("DELETED ORDER SKIPPED:", job.messageId);
+        continue;
+      }
+
       const validation =
         isCancellation
           ? { ok: true }
@@ -1021,18 +1065,23 @@ async function worker() {
           result
         );
 
+        // A delete may arrive while Apps Script is saving; cancellation is queued
+        // separately and the original message must not receive a reaction.
+        if (await isDeletedOrder(job)) {
+          console.log("DELETED AFTER SHEET SAVE - CANCELLATION PENDING:", job.messageId);
+          continue;
+        }
+
         // Only new accepted orders get an initial reaction; retries remain silent.
         // ORDER langsung ✅, sementara BBW/LIVE tetap 🛒 sampai pembagian dilakukan.
         if (!isCancellation && result === "QUEUED") {
           try {
-            const initialReaction = DIRECT_CONFIRMED_REACTION_GROUPS.has(job.groupId)
-              ? "✅"
-              : "🛒";
-            await sendReaction(job, initialReaction);
-            await rememberReaction_(job, initialReaction);
-            console.log("INITIAL REACTION SENT:", job.messageId, "|", initialReaction);
+            const queueResult = await enqueueInitialReaction_(job);
+            console.log("INITIAL REACTION QUEUED:", job.messageId, "|", queueResult);
           } catch (reactionError) {
-            console.error("INITIAL REACTION ERROR:", job.messageId, "|", reactionError.message);
+            // Order sudah tersimpan. Gagal membuat job reaction tidak boleh
+            // memasukkan ulang order ke Apps Script atau menghambat FIX lain.
+            console.error("INITIAL REACTION QUEUE ERROR:", job.messageId, "|", reactionError.message);
           }
         }
 
@@ -1050,6 +1099,11 @@ async function worker() {
           anggap invalid, beri ❌, lalu selesai.
           JANGAN requeue.
         */
+        if (await isDeletedOrder(job)) {
+          await redis.lRem(PROCESSING_QUEUE, 1, rawJob);
+          console.log("DELETED ORDER BRIDGE RETRY SKIPPED:", job.messageId);
+          continue;
+        }
         if (isInvalidProductBridgeError(bridgeError)) {
           try {
             await sendReaction(job, "❌");
@@ -1210,6 +1264,182 @@ async function allocationReactionWorker() {
       await sleep(1000);
     }
   }
+}
+
+/*
+  Reaction awal setelah order diterima Apps Script.
+  Dipisahkan dari allocationReactionWorker karena BOOK SQUAD hanya memakai ✅
+  sebagai konfirmasi pencatatan, sedangkan BBW memakai status pembagian sendiri.
+*/
+async function initialReactionWorker() {
+  console.log("Initial reaction worker started...");
+
+  while (true) {
+    let pendingName = "";
+    try {
+      const popped = await redis.blPop(INITIAL_REACTION_QUEUE, 5);
+      pendingName = String(popped?.element || "");
+      if (!pendingName) continue;
+
+      const rawPending = await redis.get(pendingName);
+      if (!rawPending) continue; // Selesai/superseded/expired.
+
+      let pending;
+      try {
+        pending = JSON.parse(rawPending);
+      } catch (err) {
+        console.error("INITIAL REACTION INVALID JOB:", pendingName);
+        await clearInitialReactionPending_(pendingName);
+        continue;
+      }
+
+      if (await isDeletedOrder(pending)) {
+        await clearInitialReactionPending_(pendingName);
+        console.log("INITIAL REACTION SKIPPED: deleted BOOK SQUAD message |", pending.messageId);
+        continue;
+      }
+
+      const lastName = reactionKeyCacheName(pending.groupId, pending.messageId) + ":last-reaction";
+      const lastReaction = await redis.get(lastName);
+      // Jangan pernah menimpa status pembagian BBW yang lebih baru.
+      if (lastReaction) {
+        await clearInitialReactionPending_(pendingName);
+        console.log("INITIAL REACTION SKIPPED: already updated |", pending.messageId, "|", lastReaction);
+        continue;
+      }
+
+      try {
+        await sendReaction(pending, pending.emoji);
+        await rememberReaction_(pending, pending.emoji);
+        await clearInitialReactionPending_(pendingName);
+        console.log("INITIAL REACTION SENT:", pending.messageId, "|", pending.emoji);
+      } catch (reactionError) {
+        const attempts = Number(pending.attempts || 0);
+
+        // Error dari Evolution (termasuk reference/message not found) bukan
+        // bukti pesan customer dihapus. Hanya tombstone webhook revoke yang
+        // boleh menghentikan job tanpa retry atau memicu pembatalan order.
+        if (await isDeletedOrder(pending)) {
+          await clearInitialReactionPending_(pendingName);
+          console.warn("INITIAL REACTION SKIPPED: deleted BOOK SQUAD message |", pending.messageId);
+          continue;
+        }
+
+        if (attempts >= INITIAL_REACTION_MAX_RETRIES) {
+          await clearInitialReactionPending_(pendingName);
+          await recordInitialReactionFailure_(pending, reactionError);
+          console.error("INITIAL REACTION FAILED AFTER RETRIES:", pending.messageId, "|", reactionError.message);
+          continue;
+        }
+
+        const retryPending = {
+          ...pending,
+          attempts: attempts + 1,
+          retriedAt: new Date().toISOString()
+        };
+        await redis.set(
+          pendingName,
+          JSON.stringify(retryPending),
+          { EX: INITIAL_REACTION_PENDING_SECONDS }
+        );
+        await sleep(INITIAL_REACTION_RETRY_DELAY_MS);
+        await redis.rPush(INITIAL_REACTION_QUEUE, pendingName);
+        console.warn(
+          "INITIAL REACTION RETRY:",
+          pending.messageId,
+          "| attempt",
+          retryPending.attempts,
+          "of",
+          INITIAL_REACTION_MAX_RETRIES,
+          "|",
+          reactionError.message
+        );
+      }
+    } catch (err) {
+      console.error("INITIAL REACTION WORKER ERROR:", pendingName || "NO_JOB", "|", err.message);
+      // Error Redis/internal worker tidak boleh menghentikan order worker.
+      await sleep(1000);
+    }
+  }
+}
+
+async function enqueueInitialReaction_(job) {
+  const groupId = String(job?.groupId || "").trim();
+  const messageId = String(job?.messageId || "").trim();
+  const participant = String(job?.participant || job?.rawKey?.participant || "").trim();
+  const instance = String(job?.instance || "Jastip-bot").trim();
+  if (!groupId || !messageId || !participant || !instance) {
+    throw new Error("initial_reaction_reference_incomplete");
+  }
+
+  if (await isDeletedOrder({ groupId, messageId })) return "deleted";
+
+  const emoji = DIRECT_CONFIRMED_REACTION_GROUPS.has(groupId) ? "✅" : "🛒";
+  const referenceName = reactionKeyCacheName(groupId, messageId);
+  const lastReaction = await redis.get(referenceName + ":last-reaction");
+  if (lastReaction) return "unchanged";
+
+  const pendingName = referenceName + ":pending-initial-reaction";
+  const pending = {
+    version: 1,
+    groupId,
+    messageId,
+    participant,
+    instance,
+    emoji,
+    attempts: 0,
+    queuedAt: new Date().toISOString()
+  };
+  const queued = await redis.set(
+    pendingName,
+    JSON.stringify(pending),
+    { NX: true, EX: INITIAL_REACTION_PENDING_SECONDS }
+  );
+  if (queued !== "OK") return "already_queued";
+
+  await redis.sAdd(INITIAL_REACTION_PENDING_INDEX, pendingName);
+  await redis.expire(INITIAL_REACTION_PENDING_INDEX, INITIAL_REACTION_PENDING_SECONDS);
+  await redis.rPush(INITIAL_REACTION_QUEUE, pendingName);
+  return "queued";
+}
+
+async function clearInitialReactionPending_(pendingName) {
+  await redis.del(pendingName);
+  await redis.sRem(INITIAL_REACTION_PENDING_INDEX, pendingName);
+}
+
+async function recoverPendingInitialReactions_() {
+  const pendingNames = await redis.sMembers(INITIAL_REACTION_PENDING_INDEX);
+  if (!pendingNames.length) {
+    console.log("INITIAL REACTION RECOVERY: no pending jobs");
+    return;
+  }
+
+  let recovered = 0;
+  for (const pendingName of pendingNames) {
+    if (await redis.exists(pendingName)) {
+      await redis.rPush(INITIAL_REACTION_QUEUE, pendingName);
+      recovered += 1;
+    } else {
+      await redis.sRem(INITIAL_REACTION_PENDING_INDEX, pendingName);
+    }
+  }
+  await redis.expire(INITIAL_REACTION_PENDING_INDEX, INITIAL_REACTION_PENDING_SECONDS);
+  console.log(`INITIAL REACTION RECOVERY: requeued ${recovered} pending job(s)`);
+}
+
+async function recordInitialReactionFailure_(pending, err) {
+  const item = JSON.stringify({
+    groupId: String(pending?.groupId || ""),
+    messageId: String(pending?.messageId || ""),
+    emoji: String(pending?.emoji || ""),
+    attempts: Number(pending?.attempts || 0),
+    failedAt: new Date().toISOString(),
+    error: String(err?.message || err || "unknown error").slice(0, 300)
+  });
+  await redis.lPush(INITIAL_REACTION_FAILED_QUEUE, item);
+  await redis.lTrim(INITIAL_REACTION_FAILED_QUEUE, 0, 99);
+  await redis.expire(INITIAL_REACTION_FAILED_QUEUE, INITIAL_REACTION_FAILED_TTL_SECONDS);
 }
 
 
@@ -1575,6 +1805,7 @@ async function processAllocationReaction_(pending) {
   const groupId = String(pending?.groupId || "").trim();
   const messageId = String(pending?.messageId || "").trim();
   const emoji = String(pending?.emoji || "").trim();
+  if (groupId === BOOK_SQUAD_GROUP_ID && await redis.exists(deletedOrderKey(groupId, messageId))) return "deleted";
   const referenceName = reactionKeyCacheName(groupId, messageId);
   const lastName = referenceName + ":last-reaction";
   const lockName = referenceName + ":update-lock";
@@ -2456,6 +2687,7 @@ async function start() {
   console.log("Redis connected.");
 
   await recoverStuckProcessingJobs();
+  await recoverPendingInitialReactions_();
 
   app.listen(
     PORT,
@@ -2483,6 +2715,13 @@ async function start() {
   // order baru berhenti dicatat ke Google Sheets.
   allocationReactionWorker().catch((err) => {
     console.error("FATAL ALLOCATION REACTION WORKER ERROR:", err);
+    process.exit(1);
+  });
+
+  // Evolution reaction awal diproses terpisah; order baru tetap menuju
+  // Google Sheets walau Evolution sedang lambat atau sementara offline.
+  initialReactionWorker().catch((err) => {
+    console.error("FATAL INITIAL REACTION WORKER ERROR:", err);
     process.exit(1);
   });
 
