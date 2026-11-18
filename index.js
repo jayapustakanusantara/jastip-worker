@@ -77,6 +77,8 @@ const SPIKE_HISTORY_LIMIT = 20;
 const QUEUE_NAME = "jastip:queue";
 const PROCESSING_QUEUE = "jastip:processing";
 const DEAD_QUEUE = "jastip:dead";
+// Persistent delayed retries: a failed Apps Script request must not sleep in the order loop.
+const SHEET_RETRY_DELAYED_QUEUE = "jastip:sheet-retry:delayed";
 
 // Reaction hasil pembagian diproses di belakang layar agar Portal cepat.
 const ALLOCATION_REACTION_QUEUE = "jastip:allocation-reaction:queue";
@@ -925,6 +927,46 @@ app.get("/spike-log", async (req, res) => {
 
   Error teknis Apps Script masih boleh retry.
 */
+// Atomic transition prevents a retry from disappearing between processing and delayed storage.
+async function scheduleSheetRetry_(rawJob, retryJob, delayMs) {
+  return redis.eval(`
+    local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
+    if removed == 1 then
+      redis.call('ZADD', KEYS[2], ARGV[3], ARGV[2])
+    end
+    return removed
+  `, {
+    keys: [PROCESSING_QUEUE, SHEET_RETRY_DELAYED_QUEUE],
+    arguments: [rawJob, JSON.stringify(retryJob), String(Date.now() + delayMs)]
+  });
+}
+
+// Move only due retries back to the regular order queue, atomically.
+// A failure/restart leaves other scheduled retries safely in Redis.
+async function sheetRetryDispatcher_() {
+  console.log("Sheet retry dispatcher started...");
+  while (true) {
+    try {
+      const moved = await redis.eval(`
+        local jobs = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 25)
+        for _, job in ipairs(jobs) do
+          if redis.call('ZREM', KEYS[1], job) == 1 then
+            redis.call('RPUSH', KEYS[2], job)
+          end
+        end
+        return #jobs
+      `, {
+        keys: [SHEET_RETRY_DELAYED_QUEUE, QUEUE_NAME],
+        arguments: [String(Date.now())]
+      });
+      if (Number(moved) > 0) console.log("SHEET RETRIES RELEASED:", moved);
+    } catch (err) {
+      console.error("SHEET RETRY DISPATCHER ERROR:", err.message);
+    }
+    await sleep(500);
+  }
+}
+
 async function worker() {
   console.log("Worker started...");
 
@@ -1149,36 +1191,20 @@ async function worker() {
           lastBridgeRetryAt: new Date().toISOString()
         };
 
-        await redis.lRem(
-          PROCESSING_QUEUE,
-          1,
-          rawJob
-        );
-
         const maxBridgeRetry =
           isCancellation ? 10 : 20;
 
         if (retryCount <= maxBridgeRetry) {
-          await redis.rPush(
-            QUEUE_NAME,
-            JSON.stringify(retryJob)
-          );
-
-          console.log(
-            "REQUEUED:",
-            job.messageId,
-            "| retry",
-            retryCount
-          );
-
           const retryDelayMs =
             isCancellation
               ? Math.min(60000, 10000 * retryCount)
               : Math.min(30000, 1500 * retryCount);
-
-          await sleep(retryDelayMs);
+          const scheduled = await scheduleSheetRetry_(rawJob, retryJob, retryDelayMs);
+          console.log("SHEET RETRY SCHEDULED:", job.messageId,
+            "| retry", retryCount, "| delayMs", retryDelayMs, "| scheduled", scheduled);
 
         } else {
+          await redis.lRem(PROCESSING_QUEUE, 1, rawJob);
           await redis.lPush(
             DEAD_QUEUE,
             JSON.stringify(retryJob)
@@ -2701,6 +2727,11 @@ async function start() {
 
   // Spike monitor berjalan terpisah dan tidak mengubah alur FIX/MAU.
   startSpikeMonitor();
+
+  sheetRetryDispatcher_().catch((err) => {
+    console.error("FATAL SHEET RETRY DISPATCHER ERROR:", err);
+    process.exit(1);
+  });
 
   worker().catch((err) => {
     console.error(
