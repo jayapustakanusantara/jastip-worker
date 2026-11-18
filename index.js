@@ -951,7 +951,7 @@ async function sheetRetryDispatcher_() {
         local jobs = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 25)
         for _, job in ipairs(jobs) do
           if redis.call('ZREM', KEYS[1], job) == 1 then
-            redis.call('LPUSH', KEYS[2], job)
+            redis.call('RPUSH', KEYS[2], job)
           end
         end
         return #jobs
