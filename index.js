@@ -130,13 +130,36 @@ const redis = createClient({
   url: REDIS_URL
 });
 
-redis.on("error", (err) => {
-  console.error("REDIS ERROR:", err);
-});
+/*
+  A blocking Redis command (BLPOP / BRPOPLPUSH) holds its TCP connection
+  until an item arrives or the timeout expires. The order, allocation
+  reaction, initial reaction and private-recap loops must therefore not share
+  the ordinary Redis connection used by webhook handlers and queue updates.
+  These duplicates point to the same Redis database; they only isolate the
+  sockets used for blocking reads.
+*/
+const orderBlockingRedis = redis.duplicate();
+const allocationReactionBlockingRedis = redis.duplicate();
+const initialReactionBlockingRedis = redis.duplicate();
+const privateRecapBlockingRedis = redis.duplicate();
 
-redis.on("ready", () => {
-  console.log("Redis READY");
-});
+const redisClients = [
+  ["main", redis],
+  ["order-blocking", orderBlockingRedis],
+  ["allocation-reaction-blocking", allocationReactionBlockingRedis],
+  ["initial-reaction-blocking", initialReactionBlockingRedis],
+  ["private-recap-blocking", privateRecapBlockingRedis]
+];
+
+for (const [name, client] of redisClients) {
+  client.on("error", (err) => {
+    console.error(`REDIS ${name} ERROR:`, err);
+  });
+
+  client.on("ready", () => {
+    console.log(`Redis ${name} READY`);
+  });
+}
 
 app.get("/", (req, res) => {
   res.json({
@@ -967,12 +990,12 @@ async function sheetRetryDispatcher_() {
   }
 }
 
-async function worker() {
+async function worker(blockingRedis = orderBlockingRedis) {
   console.log("Worker started...");
 
   while (true) {
     try {
-      const rawJob = await redis.brPopLPush(
+      const rawJob = await blockingRedis.brPopLPush(
         QUEUE_NAME,
         PROCESSING_QUEUE,
         5
@@ -1235,7 +1258,7 @@ async function allocationReactionWorker() {
   while (true) {
     let referenceName = "";
     try {
-      const popped = await redis.blPop(ALLOCATION_REACTION_QUEUE, 5);
+      const popped = await allocationReactionBlockingRedis.blPop(ALLOCATION_REACTION_QUEUE, 5);
       referenceName = String(popped?.element || "");
       if (!referenceName) continue;
 
@@ -1303,7 +1326,7 @@ async function initialReactionWorker() {
   while (true) {
     let pendingName = "";
     try {
-      const popped = await redis.blPop(INITIAL_REACTION_QUEUE, 5);
+      const popped = await initialReactionBlockingRedis.blPop(INITIAL_REACTION_QUEUE, 5);
       pendingName = String(popped?.element || "");
       if (!pendingName) continue;
 
@@ -2257,7 +2280,7 @@ async function privateRecapWorker() {
 
   while (true) {
     try {
-      const popped = await redis.blPop(PRIVATE_RECAP_QUEUE, 5);
+      const popped = await privateRecapBlockingRedis.blPop(PRIVATE_RECAP_QUEUE, 5);
       const raw = String(popped?.element || "");
       if (!raw) continue;
 
@@ -2708,7 +2731,7 @@ async function start() {
 
   console.log("Connecting Redis...");
 
-  await redis.connect();
+  await Promise.all(redisClients.map(([, client]) => client.connect()));
 
   console.log("Redis connected.");
 
