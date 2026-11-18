@@ -87,6 +87,17 @@ const ALLOCATION_REACTION_PENDING_SECONDS = 60 * 10;
 const REACTION_KEY_CACHE_SECONDS = 60 * 60 * 24 * 30;
 const REACTION_KEY_CACHE_PREFIX = "jastip:reaction-key:";
 const BBW_GROUP_ID = "120363414084709085@g.us";
+const BOOK_SQUAD_GROUP_ID = "120363214326633370@g.us"; // ORDER
+const DELETED_ORDER_TTL_SECONDS = 60 * 60 * 24 * 7;
+function deletedOrderKey(groupId, messageId) {
+  return `jastip:deleted-order:${groupId}:${messageId}`;
+}
+async function isDeletedOrder(job) {
+  return job?.action !== "CANCEL_DELETED_MESSAGE" &&
+    job?.groupId === BOOK_SQUAD_GROUP_ID &&
+    Boolean(await redis.exists(deletedOrderKey(job.groupId, job.messageId)));
+}
+
 
 const SUPPORTED_GROUPS = new Set([
   "120363214326633370@g.us", // ORDER
@@ -147,6 +158,9 @@ app.post("/internal/allocation-reaction", async (req, res) => {
     return res.status(400).json({ ok: false, error: "invalid_reference" });
   }
   if (!redis.isReady) return res.status(503).json({ ok: false, error: "redis_unavailable" });
+  if (groupId === BOOK_SQUAD_GROUP_ID && await redis.exists(deletedOrderKey(groupId, messageId))) {
+    return res.status(410).json({ ok: false, error: "original_message_deleted" });
+  }
   const referenceName = reactionKeyCacheName(groupId, messageId);
   const pendingName = referenceName + ":pending-allocation-reaction";
   try {
@@ -520,7 +534,7 @@ app.post("/", async (req, res) => {
     */
     if (isCancellationEvent) {
       // Fitur batal karena Delete for Everyone hanya berlaku di grup BBW.
-      if (remoteJid !== BBW_GROUP_ID) {
+      if (remoteJid !== BBW_GROUP_ID && remoteJid !== BOOK_SQUAD_GROUP_ID) {
         return res.status(200).json({
           ok: true,
           ignored: true,
@@ -530,8 +544,15 @@ app.post("/", async (req, res) => {
         });
       }
 
+      // Mark deletion before queueing cancellation: the FIX may still be waiting.
+      // The marker also suppresses reactions to a message WhatsApp no longer has.
+      if (remoteJid === BOOK_SQUAD_GROUP_ID) {
+        await redis.set(deletedOrderKey(remoteJid, messageId), "1", { EX: DELETED_ORDER_TTL_SECONDS });
+        await redis.del(reactionKeyCacheName(remoteJid, messageId) + ":pending-allocation-reaction");
+      }
+
       const deleteSeenKey =
-        `jastip:delete-seen:${messageId}`;
+        `jastip:delete-seen:${remoteJid}:${messageId}`;
 
       const firstDelete = await redis.set(
         deleteSeenKey,
@@ -957,6 +978,14 @@ async function worker() {
       const isCancellation =
         job.action === "CANCEL_DELETED_MESSAGE";
 
+      // A deleted BOOK SQUAD FIX must never be written after its delete event.
+      // Cancellation job stays queued separately to clean up any saved rows.
+      if (await isDeletedOrder(job)) {
+        await redis.lRem(PROCESSING_QUEUE, 1, rawJob);
+        console.log("DELETED ORDER SKIPPED:", job.messageId);
+        continue;
+      }
+
       const validation =
         isCancellation
           ? { ok: true }
@@ -1021,6 +1050,13 @@ async function worker() {
           result
         );
 
+        // A delete may arrive while Apps Script is saving; cancellation is queued
+        // separately and the original message must not receive a reaction.
+        if (await isDeletedOrder(job)) {
+          console.log("DELETED AFTER SHEET SAVE - CANCELLATION PENDING:", job.messageId);
+          continue;
+        }
+
         // Only new accepted orders get an initial reaction; retries remain silent.
         // ORDER langsung ✅, sementara BBW/LIVE tetap 🛒 sampai pembagian dilakukan.
         if (!isCancellation && result === "QUEUED") {
@@ -1050,6 +1086,11 @@ async function worker() {
           anggap invalid, beri ❌, lalu selesai.
           JANGAN requeue.
         */
+        if (await isDeletedOrder(job)) {
+          await redis.lRem(PROCESSING_QUEUE, 1, rawJob);
+          console.log("DELETED ORDER BRIDGE RETRY SKIPPED:", job.messageId);
+          continue;
+        }
         if (isInvalidProductBridgeError(bridgeError)) {
           try {
             await sendReaction(job, "❌");
@@ -1575,6 +1616,7 @@ async function processAllocationReaction_(pending) {
   const groupId = String(pending?.groupId || "").trim();
   const messageId = String(pending?.messageId || "").trim();
   const emoji = String(pending?.emoji || "").trim();
+  if (groupId === BOOK_SQUAD_GROUP_ID && await redis.exists(deletedOrderKey(groupId, messageId))) return "deleted";
   const referenceName = reactionKeyCacheName(groupId, messageId);
   const lastName = referenceName + ":last-reaction";
   const lockName = referenceName + ":update-lock";
