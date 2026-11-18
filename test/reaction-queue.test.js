@@ -5,6 +5,7 @@ const vm = require("node:vm");
 class FakeRedis {
   constructor() { this.values = new Map(); this.lists = new Map(); this.sets = new Map(); }
   on() {}
+  duplicate() { return this; }
   async set(key, value, options = {}) {
     if (options.NX && this.values.has(key)) return null;
     this.values.set(key, String(value)); return "OK";
@@ -96,11 +97,22 @@ async function testRecoveryRequeuesPendingReaction() {
   assert.deepEqual(redis.lists.get("jastip:initial-reaction:queue"), [pendingName]);
 }
 
+function testBlockingReadsUseDedicatedConnections() {
+  const source = fs.readFileSync(require.resolve("../index.js"), "utf8");
+  assert.match(source, /const orderBlockingRedis = redis\.duplicate\(\)/);
+  assert.match(source, /const initialReactionBlockingRedis = redis\.duplicate\(\)/);
+  assert.match(source, /const allocationReactionBlockingRedis = redis\.duplicate\(\)/);
+  assert.match(source, /const privateRecapBlockingRedis = redis\.duplicate\(\)/);
+  assert.match(source, /blockingRedis\.brPopLPush\(/);
+  assert.match(source, /initialReactionBlockingRedis\.blPop\(/);
+}
+
 (async () => {
   await testSuccessfulBookSquadReaction();
   await testBbwInitialReactionStaysCart();
   await testRetriesDoNotCancelOrder();
   await testValidDeleteSuppressesReaction();
   await testRecoveryRequeuesPendingReaction();
+  testBlockingReadsUseDedicatedConnections();
   console.log("reaction-queue tests passed");
 })().catch((err) => { console.error(err); process.exitCode = 1; });
