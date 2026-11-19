@@ -222,6 +222,52 @@ app.post("/internal/allocation-reaction", async (req, res) => {
   }
 });
 
+/*
+  Internal acknowledgement from Apps Script after all order rows have been
+  written and verified. This only queues the existing initial-reaction worker;
+  it never writes an order and cannot block the FIX queue.
+*/
+app.post("/internal/order-recorded-reaction", async (req, res) => {
+  const crypto = require("node:crypto");
+  const supplied = String(req.get("x-worker-secret") || "");
+  const expected = String(WORKER_SECRET || "");
+  if (!expected || !supplied || Buffer.byteLength(expected) !== Buffer.byteLength(supplied) ||
+      !crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(supplied))) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+
+  const groupId = String(req.body?.groupId || "").trim();
+  const messageId = String(req.body?.messageId || "").trim();
+  if (!SUPPORTED_GROUPS.has(groupId) || !/^[A-Za-z0-9_:\-]{4,160}$/.test(messageId)) {
+    return res.status(400).json({ ok: false, error: "invalid_reference" });
+  }
+  if (!redis.isReady) return res.status(503).json({ ok: false, error: "redis_unavailable" });
+  if (await isDeletedOrder({ groupId, messageId })) {
+    return res.status(410).json({ ok: false, error: "original_message_deleted" });
+  }
+
+  try {
+    const rawKey = await redis.get(reactionKeyCacheName(groupId, messageId));
+    if (!rawKey) return res.status(404).json({ ok: false, error: "original_key_not_cached" });
+    const originalKey = JSON.parse(rawKey);
+    if (originalKey.groupId !== groupId || originalKey.messageId !== messageId ||
+        !originalKey.participant || !originalKey.instance) {
+      return res.status(422).json({ ok: false, error: "invalid_cached_key" });
+    }
+
+    const result = await enqueueInitialReaction_({
+      groupId,
+      messageId,
+      participant: originalKey.participant,
+      instance: originalKey.instance
+    });
+    return res.status(202).json({ ok: true, queued: result });
+  } catch (err) {
+    console.error("ORDER-RECORDED REACTION QUEUE ERROR:", err.message);
+    return res.status(502).json({ ok: false, error: "reaction_queue_failed" });
+  }
+});
+
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -1764,6 +1810,7 @@ async function sendJobToAppsScript(job) {
     }
 
     const accepted = new Set([
+      "ACCEPTED",
       "QUEUED",
       "ALREADY QUEUED",
       "CANCELLED",
