@@ -88,8 +88,8 @@ const ALLOCATION_REACTION_PENDING_SECONDS = 60 * 10;
 // tidak pernah menunda pencatatan FIX/MAU ke Google Sheets.
 const INITIAL_REACTION_QUEUE = "jastip:initial-reaction:queue";
 const INITIAL_REACTION_PENDING_SECONDS = 60 * 15;
-const INITIAL_REACTION_MAX_RETRIES = 2;
-const INITIAL_REACTION_RETRY_DELAY_MS = 750;
+const INITIAL_REACTION_MAX_RETRIES = 5;
+const INITIAL_REACTION_RETRY_DELAYS_MS = [2000, 5000, 15000, 30000, 60000];
 const INITIAL_REACTION_FAILED_QUEUE = "jastip:initial-reaction:failed";
 const INITIAL_REACTION_FAILED_TTL_SECONDS = 60 * 60 * 24 * 7;
 // Index ini memastikan job reaction yang sudah di-pop tetapi worker restart
@@ -1437,8 +1437,11 @@ async function initialReactionWorker() {
           JSON.stringify(retryPending),
           { EX: INITIAL_REACTION_PENDING_SECONDS }
         );
-        await sleep(INITIAL_REACTION_RETRY_DELAY_MS);
-        await redis.rPush(INITIAL_REACTION_QUEUE, pendingName);
+        await sleep(INITIAL_REACTION_RETRY_DELAYS_MS[attempts] || 60000);
+        // Do not resurrect a job that was cleared while waiting.
+        if (await redis.exists(pendingName)) {
+          await redis.rPush(INITIAL_REACTION_QUEUE, pendingName);
+        }
         console.warn(
           "INITIAL REACTION RETRY:",
           pending.messageId,
