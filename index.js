@@ -141,6 +141,8 @@ const redis = createClient({
 const orderBlockingRedis = redis.duplicate();
 const allocationReactionBlockingRedis = redis.duplicate();
 const initialReactionBlockingRedis = redis.duplicate();
+// Separate blocking connection: two initial reactions can be delivered concurrently.
+const initialReactionBlockingRedis2 = redis.duplicate();
 const privateRecapBlockingRedis = redis.duplicate();
 
 const redisClients = [
@@ -148,6 +150,7 @@ const redisClients = [
   ["order-blocking", orderBlockingRedis],
   ["allocation-reaction-blocking", allocationReactionBlockingRedis],
   ["initial-reaction-blocking", initialReactionBlockingRedis],
+  ["initial-reaction-blocking-2", initialReactionBlockingRedis2],
   ["private-recap-blocking", privateRecapBlockingRedis]
 ];
 
@@ -1366,13 +1369,13 @@ async function allocationReactionWorker() {
   Dipisahkan dari allocationReactionWorker karena BOOK SQUAD hanya memakai ✅
   sebagai konfirmasi pencatatan, sedangkan BBW memakai status pembagian sendiri.
 */
-async function initialReactionWorker() {
-  console.log("Initial reaction worker started...");
+async function initialReactionWorker(blockingClient, workerNumber) {
+  console.log(`Initial reaction worker ${workerNumber} started...`);
 
   while (true) {
     let pendingName = "";
     try {
-      const popped = await initialReactionBlockingRedis.blPop(INITIAL_REACTION_QUEUE, 5);
+      const popped = await blockingClient.blPop(INITIAL_REACTION_QUEUE, 5);
       pendingName = String(popped?.element || "");
       if (!pendingName) continue;
 
@@ -2824,10 +2827,12 @@ async function start() {
 
   // Evolution reaction awal diproses terpisah; order baru tetap menuju
   // Google Sheets walau Evolution sedang lambat atau sementara offline.
-  initialReactionWorker().catch((err) => {
-    console.error("FATAL INITIAL REACTION WORKER ERROR:", err);
-    process.exit(1);
-  });
+  for (const [workerNumber, client] of [[1, initialReactionBlockingRedis], [2, initialReactionBlockingRedis2]]) {
+    initialReactionWorker(client, workerNumber).catch((err) => {
+      console.error("FATAL INITIAL REACTION WORKER ERROR:", workerNumber, err);
+      process.exit(1);
+    });
+  }
 
   // Dipisahkan dari order queue: request rekap private tidak boleh menunda
   // pencatatan FIX/MAU bila Web App Rekapan sedang lambat.
