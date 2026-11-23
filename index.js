@@ -95,6 +95,7 @@ const INITIAL_REACTION_FAILED_TTL_SECONDS = 60 * 60 * 24 * 7;
 // Index ini memastikan job reaction yang sudah di-pop tetapi worker restart
 // tetap bisa dimasukkan kembali saat startup. Data order tidak ikut disentuh.
 const INITIAL_REACTION_PENDING_INDEX = "jastip:initial-reaction:pending-index";
+const INITIAL_REACTION_RETRY_SCHEDULE = "jastip:initial-reaction:retry-schedule";
 
 // Key WhatsApp asli untuk update reaction setelah admin menyimpan pembagian.
 // TTL terbatas agar Redis tidak menjadi arsip chat permanen.
@@ -1440,11 +1441,8 @@ async function initialReactionWorker(blockingClient, workerNumber) {
           JSON.stringify(retryPending),
           { EX: INITIAL_REACTION_PENDING_SECONDS }
         );
-        await sleep(INITIAL_REACTION_RETRY_DELAYS_MS[attempts] || 60000);
-        // Do not resurrect a job that was cleared while waiting.
-        if (await redis.exists(pendingName)) {
-          await redis.rPush(INITIAL_REACTION_QUEUE, pendingName);
-        }
+        // Schedule durable retry in Redis; do not block this reaction worker.
+        await redis.zAdd(INITIAL_REACTION_RETRY_SCHEDULE, { score: Date.now() + (INITIAL_REACTION_RETRY_DELAYS_MS[attempts] || 60000), value: pendingName });
         console.warn(
           "INITIAL REACTION RETRY:",
           pending.messageId,
@@ -1505,6 +1503,7 @@ async function enqueueInitialReaction_(job) {
 }
 
 async function clearInitialReactionPending_(pendingName) {
+  await redis.zRem(INITIAL_REACTION_RETRY_SCHEDULE, pendingName);
   await redis.del(pendingName);
   await redis.sRem(INITIAL_REACTION_PENDING_INDEX, pendingName);
 }
@@ -1519,6 +1518,7 @@ async function recoverPendingInitialReactions_() {
   let recovered = 0;
   for (const pendingName of pendingNames) {
     if (await redis.exists(pendingName)) {
+      await redis.zRem(INITIAL_REACTION_RETRY_SCHEDULE, pendingName);
       await redis.rPush(INITIAL_REACTION_QUEUE, pendingName);
       recovered += 1;
     } else {
@@ -1527,6 +1527,23 @@ async function recoverPendingInitialReactions_() {
   }
   await redis.expire(INITIAL_REACTION_PENDING_INDEX, INITIAL_REACTION_PENDING_SECONDS);
   console.log(`INITIAL REACTION RECOVERY: requeued ${recovered} pending job(s)`);
+}
+
+// Periodically dispatch scheduled retries without blocking WhatsApp reaction workers.
+async function initialReactionRetryDispatcher_() {
+  while (true) {
+    try {
+      const due = await redis.zRangeByScore(INITIAL_REACTION_RETRY_SCHEDULE, 0, Date.now(), { LIMIT: { offset: 0, count: 100 } });
+      for (const name of due) {
+        if (await redis.zRem(INITIAL_REACTION_RETRY_SCHEDULE, name)) {
+          if (await redis.exists(name)) await redis.rPush(INITIAL_REACTION_QUEUE, name);
+        }
+      }
+    } catch (err) {
+      console.error("INITIAL REACTION RETRY DISPATCHER ERROR:", err.message);
+    }
+    await sleep(2000);
+  }
 }
 
 async function recordInitialReactionFailure_(pending, err) {
@@ -2824,6 +2841,8 @@ async function start() {
     console.error("FATAL ALLOCATION REACTION WORKER ERROR:", err);
     process.exit(1);
   });
+
+  initialReactionRetryDispatcher_().catch((err) => console.error("FATAL INITIAL REACTION RETRY DISPATCHER:", err));
 
   // Evolution reaction awal diproses terpisah; order baru tetap menuju
   // Google Sheets walau Evolution sedang lambat atau sementara offline.
