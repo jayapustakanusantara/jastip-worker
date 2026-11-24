@@ -1370,6 +1370,45 @@ async function allocationReactionWorker() {
   Dipisahkan dari allocationReactionWorker karena BOOK SQUAD hanya memakai ✅
   sebagai konfirmasi pencatatan, sedangkan BBW memakai status pembagian sendiri.
 */
+// Event-driven recovery: no periodic pending-index scan.
+const initialReactionActive = new Set();
+let initialReactionBusy = false;
+let initialReactionCheckRunning = false;
+async function checkInitialReactionBacklog_() {
+  if (initialReactionCheckRunning) return;
+  initialReactionCheckRunning = true;
+  try {
+    const depth = await redis.lLen(INITIAL_REACTION_QUEUE);
+    if (depth >= 30) {
+      if (!initialReactionBusy) console.log("INITIAL REACTION BUSY:", depth);
+      initialReactionBusy = true;
+    }
+    if (!initialReactionBusy || depth > 5) return;
+    const queued = new Set(await redis.lRange(INITIAL_REACTION_QUEUE, 0, -1));
+    const names = await redis.sMembers(INITIAL_REACTION_PENDING_INDEX);
+    let recovered = 0;
+    for (const name of names) {
+      if (queued.has(name) || initialReactionActive.has(name)) continue;
+      if (await redis.zScore(INITIAL_REACTION_RETRY_SCHEDULE, name) !== null) continue;
+      const raw = await redis.get(name);
+      if (!raw) continue;
+      const pending = JSON.parse(raw);
+      if (Date.now() - Date.parse(pending.retriedAt || pending.queuedAt) < 60000) continue;
+      if (await isDeletedOrder(pending)) continue;
+      if (await redis.get(reactionKeyCacheName(pending.groupId, pending.messageId) + ":last-reaction")) continue;
+      if (initialReactionActive.has(name)) continue;
+      if (await redis.zScore(INITIAL_REACTION_RETRY_SCHEDULE, name) !== null) continue;
+      await redis.rPush(INITIAL_REACTION_QUEUE, name);
+      recovered++;
+    }
+    initialReactionBusy = false;
+    console.log("INITIAL REACTION ADAPTIVE RECOVERY:", recovered, "| depth", depth);
+  } catch (err) {
+    console.error("INITIAL REACTION ADAPTIVE ERROR:", err.message);
+  } finally {
+    initialReactionCheckRunning = false;
+  }
+}
 async function initialReactionWorker(blockingClient, workerNumber) {
   console.log(`Initial reaction worker ${workerNumber} started...`);
 
@@ -1379,6 +1418,8 @@ async function initialReactionWorker(blockingClient, workerNumber) {
       const popped = await blockingClient.blPop(INITIAL_REACTION_QUEUE, 5);
       pendingName = String(popped?.element || "");
       if (!pendingName) continue;
+      if (initialReactionActive.has(pendingName)) { pendingName = ""; continue; }
+      initialReactionActive.add(pendingName);
 
       const rawPending = await redis.get(pendingName);
       if (!rawPending) continue; // Selesai/superseded/expired.
@@ -1458,6 +1499,8 @@ async function initialReactionWorker(blockingClient, workerNumber) {
       console.error("INITIAL REACTION WORKER ERROR:", pendingName || "NO_JOB", "|", err.message);
       // Error Redis/internal worker tidak boleh menghentikan order worker.
       await sleep(1000);
+    } finally {
+      if (pendingName) { initialReactionActive.delete(pendingName); await checkInitialReactionBacklog_(); }
     }
   }
 }
@@ -1499,6 +1542,7 @@ async function enqueueInitialReaction_(job) {
   await redis.sAdd(INITIAL_REACTION_PENDING_INDEX, pendingName);
   await redis.expire(INITIAL_REACTION_PENDING_INDEX, INITIAL_REACTION_PENDING_SECONDS);
   await redis.rPush(INITIAL_REACTION_QUEUE, pendingName);
+  await checkInitialReactionBacklog_();
   return "queued";
 }
 
