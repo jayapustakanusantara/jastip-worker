@@ -198,6 +198,10 @@ app.post("/internal/allocation-reaction", async (req, res) => {
   if (!SUPPORTED_GROUPS.has(groupId) || !/^[A-Za-z0-9_:\-]{4,160}$/.test(messageId) || !["🛒", "🟡", "✅"].includes(emoji) || !allowedSheets.has(sourceSheet)) {
     return res.status(400).json({ ok: false, error: "invalid_reference" });
   }
+  // BBW uses initial cart acknowledgement only; allocation is Sheet-only.
+  if (groupId === BBW_GROUP_ID || sourceSheet.startsWith("ORDER BBW")) {
+    return res.status(200).json({ ok: true, queued: false, skipped: true, reason: "bbw_cart_only" });
+  }
   if (!redis.isReady) return res.status(503).json({ ok: false, error: "redis_unavailable" });
   if (groupId === BOOK_SQUAD_GROUP_ID && await redis.exists(deletedOrderKey(groupId, messageId))) {
     return res.status(410).json({ ok: false, error: "original_message_deleted" });
@@ -1987,6 +1991,7 @@ async function processAllocationReaction_(pending) {
   const groupId = String(pending?.groupId || "").trim();
   const messageId = String(pending?.messageId || "").trim();
   const emoji = String(pending?.emoji || "").trim();
+  if (groupId === BBW_GROUP_ID) return "bbw_cart_only";
   if (groupId === BOOK_SQUAD_GROUP_ID && await redis.exists(deletedOrderKey(groupId, messageId))) return "deleted";
   const referenceName = reactionKeyCacheName(groupId, messageId);
   const lastName = referenceName + ":last-reaction";
