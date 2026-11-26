@@ -1307,16 +1307,18 @@ async function allocationReactionWorker() {
 
   while (true) {
     let referenceName = "";
+    let rawPending = null;
+    let pendingName = "";
+    let pending;
     try {
       const popped = await allocationReactionBlockingRedis.blPop(ALLOCATION_REACTION_QUEUE, 5);
       referenceName = String(popped?.element || "");
       if (!referenceName) continue;
 
-      const pendingName = referenceName + ":pending-allocation-reaction";
-      const rawPending = await redis.get(pendingName);
+      pendingName = referenceName + ":pending-allocation-reaction";
+      rawPending = await redis.get(pendingName);
       if (!rawPending) continue; // Job lama, sudah digantikan/selesai.
 
-      let pending;
       try {
         pending = JSON.parse(rawPending);
       } catch (err) {
@@ -1336,7 +1338,7 @@ async function allocationReactionWorker() {
           "|",
           pending.emoji,
           "|",
-          result
+          result, "| queuedAt:", pending.queuedAt || "-", "| retries:", pending.attempts || 0
         );
       } else if (latest) {
         // Ada save yang lebih baru saat Evolution sedang diproses.
@@ -1353,12 +1355,25 @@ async function allocationReactionWorker() {
         "|",
         err.message
       );
-      // Pending status tetap disimpan; retry tidak pernah membatalkan
-      // pembagian buku yang sudah tersimpan di Google Sheets.
-      if (referenceName && nonRetryable.has(String(err.message || ""))) {
-        await redis.del(referenceName + ":pending-allocation-reaction");
-      } else if (referenceName) {
-        await redis.rPush(ALLOCATION_REACTION_QUEUE, referenceName);
+      // Atomic compare-and-set: never overwrite a newer allocation.
+      if (referenceName && rawPending && pending) {
+        const attempts = Number(pending.attempts || 0);
+        const permanent = nonRetryable.has(String(err.message || "")) ||
+          /Evolution reaction HTTP (400|401|403|404|422):/.test(String(err.message || ""));
+        const stop = permanent || attempts >= 2;
+        const next = JSON.stringify({...pending, attempts: attempts + 1});
+        const changed = await redis.eval(
+          "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end; if ARGV[2] == '1' then redis.call('DEL', KEYS[1]); return 1 end; redis.call('SET', KEYS[1], ARGV[3], 'KEEPTTL'); return 1",
+          {keys:[pendingName], arguments:[rawPending, stop ? "1" : "0", next]}
+        );
+        if (changed && stop) {
+          console.error("ALLOCATION REACTION FAILED:", pending.messageId, "| queuedAt:", pending.queuedAt || "-", "| retries:", attempts, "|", err.message);
+        } else if (changed) {
+          const delay = attempts === 0 ? 5000 : 15000;
+          console.warn("ALLOCATION REACTION RETRY:", pending.messageId, "| attempt:", attempts + 1, "| queuedAt:", pending.queuedAt || "-");
+          await sleep(delay);
+          if (await redis.get(pendingName) === next) await redis.rPush(ALLOCATION_REACTION_QUEUE, referenceName);
+        }
       }
       await sleep(1000);
     }
