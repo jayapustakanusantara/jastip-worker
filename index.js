@@ -1622,7 +1622,14 @@ function validateOrderJob(job) {
     };
   }
 
-  const title = extractLikelyTitle(quoted);
+  // WhatsApp renders mention JIDs as @ followed by a numeric identifier.
+  // Never interpret these identifiers as product titles or prices.
+  const productText = quoted.replace(/@\d+(?:@(?:lid|s\.whatsapp\.net))?\b/gi, "").trim();
+  if (!productText) {
+    return { ok: false, reason: "MENTION ONLY" };
+  }
+
+  const title = extractLikelyTitle(productText);
 
   if (!title) {
     return {
@@ -1651,7 +1658,7 @@ function validateOrderJob(job) {
 
   // Harga wajib ada di quoted product. FREE dianggap valid untuk giveaway.
   // ISBN 10/13 digit tidak boleh salah terbaca sebagai harga.
-  const price = extractLikelyPrice(quoted);
+  const price = extractLikelyPrice(productText);
 
   if (!price) {
     return {
