@@ -194,6 +194,10 @@ app.post("/internal/allocation-reaction", async (req, res) => {
   const messageId = String(req.body?.messageId || "").trim();
   const emoji = String(req.body?.reaction || "").trim();
   const sourceSheet = String(req.body?.sourceSheet || "").trim();
+  if (process.env.BMA_ALLOCATION_REACTION_ENABLED !== "true") {
+    console.log("ALLOCATION REACTION DISABLED:", groupId, messageId);
+    return res.status(200).json({ ok: true, queued: false, skipped: true, reason: "allocation_disabled" });
+  }
   const allowedSheets = new Set(["ORDER BBW", "ORDER BBW JOGJA", "ORDER BBW GI", "ORDER LIVE"]);
   if (!SUPPORTED_GROUPS.has(groupId) || !/^[A-Za-z0-9_:\-]{4,160}$/.test(messageId) || !["🛒", "🟡", "✅"].includes(emoji) || !allowedSheets.has(sourceSheet)) {
     return res.status(400).json({ ok: false, error: "invalid_reference" });
@@ -1991,6 +1995,7 @@ async function processAllocationReaction_(pending) {
   const groupId = String(pending?.groupId || "").trim();
   const messageId = String(pending?.messageId || "").trim();
   const emoji = String(pending?.emoji || "").trim();
+  if (process.env.BMA_ALLOCATION_REACTION_ENABLED !== "true") return "allocation_disabled";
   if (groupId === BBW_GROUP_ID) return "bbw_cart_only";
   if (groupId === BOOK_SQUAD_GROUP_ID && await redis.exists(deletedOrderKey(groupId, messageId))) return "deleted";
   const referenceName = reactionKeyCacheName(groupId, messageId);
