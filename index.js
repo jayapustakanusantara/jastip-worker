@@ -1355,6 +1355,7 @@ async function allocationReactionWorker() {
         "|",
         err.message
       );
+      try {
       // Atomic compare-and-set: never overwrite a newer allocation.
       if (referenceName && rawPending && pending) {
         const attempts = Number(pending.attempts || 0);
@@ -1374,6 +1375,9 @@ async function allocationReactionWorker() {
           await sleep(delay);
           if (await redis.get(pendingName) === next) await redis.rPush(ALLOCATION_REACTION_QUEUE, referenceName);
         }
+      }
+      } catch (retryError) {
+        console.error("ALLOCATION REACTION RETRY STORAGE ERROR:", referenceName, "|", retryError.message);
       }
       await sleep(1000);
     }
