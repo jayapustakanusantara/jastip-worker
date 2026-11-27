@@ -2766,9 +2766,17 @@ async function ensureGroupParticipantWebhook_(instance) {
   const webhook = await current.json();
   const events = Array.isArray(webhook?.events) ? webhook.events.map(String) : [];
   if (!webhook?.enabled || events.includes("GROUP_PARTICIPANTS_UPDATE")) return;
+  const safeWebhook = {
+    enabled: Boolean(webhook.enabled),
+    url: String(webhook.url || ""),
+    events: [...events, "GROUP_PARTICIPANTS_UPDATE"],
+    headers: webhook.headers || undefined,
+    byEvents: Boolean(webhook.byEvents ?? webhook.webhookByEvents),
+    base64: Boolean(webhook.base64 ?? webhook.webhookBase64)
+  };
   const response = await fetch(base + "/webhook/set/" + encodeURIComponent(instance), {
     method: "POST", headers,
-    body: JSON.stringify({ webhook: { ...webhook, events: [...events, "GROUP_PARTICIPANTS_UPDATE"] } })
+    body: JSON.stringify({ webhook: safeWebhook })
   });
   if (!response.ok) throw new Error("webhook_set_http_" + response.status);
   console.log("GROUP_PARTICIPANTS_UPDATE ENABLED");
