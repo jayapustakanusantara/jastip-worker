@@ -114,6 +114,7 @@ const REACTION_KEY_CACHE_SECONDS = 60 * 60 * 24 * 30;
 const REACTION_KEY_CACHE_PREFIX = "jastip:reaction-key:";
 const BBW_GROUP_ID = "120363414084709085@g.us";
 const BOOK_SQUAD_GROUP_ID = "120363214326633370@g.us"; // ORDER
+const CONTACT_MAP_GROUPS = new Set([BBW_GROUP_ID, BOOK_SQUAD_GROUP_ID]);
 const DELETED_ORDER_TTL_SECONDS = 60 * 60 * 24 * 7;
 function deletedOrderKey(groupId, messageId) {
   return `jastip:deleted-order:${groupId}:${messageId}`;
@@ -638,7 +639,7 @@ app.post("/", async (req, res) => {
     // Learn only a proven LID <-> phone pair. This runs for ordinary inbound
     // chats as well as FIX/MAU, but never for delete, reaction or protocol
     // events. It is intentionally best-effort and isolated from order intake.
-    if (!isCancellationEvent && isContactMappingEligible_(message)) {
+    if (!isCancellationEvent && CONTACT_MAP_GROUPS.has(remoteJid) && isContactMappingEligible_(message)) {
       const contactMapping = extractContactMapping_([
         key.participant, key.participantAlt,
         protocolKey.participant, protocolKey.participantAlt,
