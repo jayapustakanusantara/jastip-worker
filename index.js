@@ -2757,6 +2757,23 @@ async function refreshGroupContactMappings_(groupId, instance) {
   }
 }
 
+async function ensureGroupParticipantWebhook_(instance) {
+  if (!EVOLUTION_API_URL || !EVOLUTION_API_KEY) return;
+  const base = String(EVOLUTION_API_URL).replace(/\/+$/, "");
+  const headers = { apikey: EVOLUTION_API_KEY, "content-type": "application/json" };
+  const current = await fetch(base + "/webhook/find/" + encodeURIComponent(instance), { headers });
+  if (!current.ok) throw new Error("webhook_find_http_" + current.status);
+  const webhook = await current.json();
+  const events = Array.isArray(webhook?.events) ? webhook.events.map(String) : [];
+  if (!webhook?.enabled || events.includes("GROUP_PARTICIPANTS_UPDATE")) return;
+  const response = await fetch(base + "/webhook/set/" + encodeURIComponent(instance), {
+    method: "POST", headers,
+    body: JSON.stringify({ webhook: { ...webhook, events: [...events, "GROUP_PARTICIPANTS_UPDATE"] } })
+  });
+  if (!response.ok) throw new Error("webhook_set_http_" + response.status);
+  console.log("GROUP_PARTICIPANTS_UPDATE ENABLED");
+}
+
 function cleanPushName_(value) {
   const name = String(value || "").trim();
   return !name || /@lid$/i.test(name) || /^\d+$/.test(name) ? "" : name.slice(0, 120);
@@ -3126,6 +3143,8 @@ async function start() {
   await recoverStuckProcessingJobs();
   await recoverPendingInitialReactions_();
   await recoverStuckContactMappings_();
+  ensureGroupParticipantWebhook_(TRACE_REPLY_INSTANCE)
+    .catch((err) => console.error("GROUP PARTICIPANT WEBHOOK CONFIG ERROR:", err.message));
 
   // Initial member sync runs once per group every 30 days, never on every
   // reconnect or process restart.
