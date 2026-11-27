@@ -39,6 +39,17 @@ const PRIVATE_RECAP_QUEUE = "jastip:private-recap:queue";
 const PRIVATE_RECAP_SEEN_PREFIX = "jastip:private-recap:seen:";
 const PRIVATE_RECAP_SEEN_SECONDS = 60 * 60 * 24 * 7;
 
+// BMA.19 contact mapping is deliberately isolated from order and reaction
+// traffic. A mapping failure must never delay or reject a FIX/MAU webhook.
+const CONTACT_MAP_QUEUE = "jastip:contact-map:queue";
+const CONTACT_MAP_PROCESSING_QUEUE = "jastip:contact-map:processing";
+const CONTACT_MAP_DELAYED_QUEUE = "jastip:contact-map:delayed";
+const CONTACT_MAP_DEAD_QUEUE = "jastip:contact-map:dead";
+const CONTACT_MAP_DEDUP_PREFIX = "jastip:contact-map:dedup:";
+const CONTACT_MAP_DEDUP_SECONDS = 60 * 60 * 24;
+const CONTACT_MAP_BATCH_SIZE = Math.max(1, Math.min(100, Number(process.env.CONTACT_MAP_BATCH_SIZE || 50)));
+const CONTACT_MAP_MAX_RETRIES = 8;
+
 
 // =====================================================
 // EVOLUTION / RAILWAY SPIKE MONITOR
@@ -145,6 +156,7 @@ const initialReactionBlockingRedis = redis.duplicate();
 // Separate blocking connection: two initial reactions can be delivered concurrently.
 const initialReactionBlockingRedis2 = redis.duplicate();
 const privateRecapBlockingRedis = redis.duplicate();
+const contactMapBlockingRedis = redis.duplicate();
 
 const redisClients = [
   ["main", redis],
@@ -152,7 +164,8 @@ const redisClients = [
   ["allocation-reaction-blocking", allocationReactionBlockingRedis],
   ["initial-reaction-blocking", initialReactionBlockingRedis],
   ["initial-reaction-blocking-2", initialReactionBlockingRedis2],
-  ["private-recap-blocking", privateRecapBlockingRedis]
+  ["private-recap-blocking", privateRecapBlockingRedis],
+  ["contact-map-blocking", contactMapBlockingRedis]
 ];
 
 for (const [name, client] of redisClients) {
@@ -622,6 +635,25 @@ app.post("/", async (req, res) => {
       data.notifyName ||
       "";
 
+    // Learn only a proven LID <-> phone pair. This runs for ordinary inbound
+    // chats as well as FIX/MAU, but never for delete, reaction or protocol
+    // events. It is intentionally best-effort and isolated from order intake.
+    if (!isCancellationEvent && isContactMappingEligible_(message)) {
+      const contactMapping = extractContactMapping_([
+        key.participant, key.participantAlt,
+        protocolKey.participant, protocolKey.participantAlt,
+        keysArrayKey.participant, keysArrayKey.participantAlt,
+        outerKey.participant, outerKey.participantAlt,
+        data.participant, data.participantAlt,
+        participant, participantAlt
+      ], pushName);
+      if (contactMapping) {
+        queueContactMappingSafely_(contactMapping).catch((err) =>
+          console.error("CONTACT MAP QUEUE ERROR:", err.message)
+        );
+      }
+    }
+
     /*
       Customer menghapus pesan FIX/MAU.
       Tidak semua pesan yang dihapus adalah order, jadi Apps Script nanti
@@ -1046,6 +1078,75 @@ async function sheetRetryDispatcher_() {
     }
     await sleep(500);
   }
+}
+
+async function sendContactMappingsToAppsScript_(mappings) {
+  if (!APPS_SCRIPT_URL || !WORKER_SECRET) throw new Error("contact_map_bridge_not_configured");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12_000);
+  try {
+    const response = await fetch(APPS_SCRIPT_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        source: "railway-contact-map",
+        workerSecret: WORKER_SECRET,
+        mappings
+      }),
+      signal: controller.signal
+    });
+    const body = String(await response.text() || "").trim();
+    if (!response.ok || !/^CONTACT_MAP_ACCEPTED/.test(body)) {
+      throw new Error("contact_map_http_" + response.status + ":" + body.slice(0, 300));
+    }
+    return body;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function contactMapWorker() {
+  console.log("Contact mapping worker started...");
+  while (true) {
+    let raws = [];
+    try {
+      const first = await contactMapBlockingRedis.brPopLPush(CONTACT_MAP_QUEUE, CONTACT_MAP_PROCESSING_QUEUE, 5);
+      if (!first) continue;
+      raws = [first];
+      while (raws.length < CONTACT_MAP_BATCH_SIZE) {
+        const next = await redis.rPopLPush(CONTACT_MAP_QUEUE, CONTACT_MAP_PROCESSING_QUEUE);
+        if (!next) break;
+        raws.push(next);
+      }
+      const parsed = raws.map((item) => ({ raw: item, job: JSON.parse(item) }));
+      const byPair = new Map();
+      for (const item of parsed) byPair.set(item.job.lid + ":" + item.job.phone, item);
+      await sendContactMappingsToAppsScript_([...byPair.values()].map((item) => item.job));
+      for (const item of parsed) await redis.lRem(CONTACT_MAP_PROCESSING_QUEUE, 1, item.raw);
+      console.log("CONTACT MAP ACCEPTED:", parsed.length);
+    } catch (err) {
+      console.error("CONTACT MAP WORKER ERROR:", err.message);
+      if (raws.length) {
+        // Requeue the exact durable payload. Dedup is intentionally left in
+        // place because this job already exists in a durable queue.
+        for (const raw of raws) {
+          await redis.lRem(CONTACT_MAP_PROCESSING_QUEUE, 1, raw).catch(() => {});
+          await redis.rPush(CONTACT_MAP_QUEUE, raw).catch(() => {});
+        }
+      }
+      await sleep(1500);
+    }
+  }
+}
+
+async function recoverStuckContactMappings_() {
+  const stuck = await redis.lRange(CONTACT_MAP_PROCESSING_QUEUE, 0, -1);
+  if (!stuck.length) return;
+  await redis.multi()
+    .del(CONTACT_MAP_PROCESSING_QUEUE)
+    .rPush(CONTACT_MAP_QUEUE, stuck)
+    .exec();
+  console.warn("CONTACT MAP RECOVERED AFTER RESTART:", stuck.length);
 }
 
 async function worker(blockingRedis = orderBlockingRedis) {
@@ -2542,6 +2643,71 @@ function extractMentionJid(message, dataContextInfo) {
   }
 }
 
+function normalizeContactJid_(value) {
+  const raw = String(value || "").trim().toLowerCase().replace(/:\d+(?=@)/, "");
+  if (!raw) return null;
+  if (raw.endsWith("@lid")) {
+    const id = raw.slice(0, -4).replace(/\D/g, "");
+    return id ? { kind: "lid", id, jid: id + "@lid" } : null;
+  }
+  if (raw.endsWith("@s.whatsapp.net")) {
+    const id = raw.slice(0, -"@s.whatsapp.net".length).replace(/\D/g, "");
+    // Do not infer a phone from a bare number or LID; accept only explicit WA JIDs.
+    return id.length >= 7 ? { kind: "phone", id, jid: id + "@s.whatsapp.net" } : null;
+  }
+  return null;
+}
+
+function extractContactMapping_(candidates, pushName) {
+  let lid = null;
+  let phone = null;
+  for (const candidate of candidates || []) {
+    const normalized = normalizeContactJid_(candidate);
+    if (!normalized) continue;
+    if (normalized.kind === "lid") lid = lid || normalized;
+    if (normalized.kind === "phone") phone = phone || normalized;
+  }
+  if (!lid || !phone) return null;
+  return {
+    lid: lid.id,
+    phone: phone.id,
+    lidJid: lid.jid,
+    phoneJid: phone.jid,
+    pushName: cleanPushName_(pushName),
+    observedAt: new Date().toISOString()
+  };
+}
+
+function cleanPushName_(value) {
+  const name = String(value || "").trim();
+  return !name || /@lid$/i.test(name) || /^\d+$/.test(name) ? "" : name.slice(0, 120);
+}
+
+function isContactMappingEligible_(message) {
+  return Boolean(message && typeof message === "object" &&
+    !message.reactionMessage &&
+    !message.protocolMessage &&
+    !message.senderKeyDistributionMessage);
+}
+
+async function queueContactMappingSafely_(mapping) {
+  const dedupKey = CONTACT_MAP_DEDUP_PREFIX + mapping.lid + ":" + mapping.phone;
+  const raw = JSON.stringify(mapping);
+  // LPUSH first and SETEX in the same Lua transaction: a failed enqueue can
+  // never be hidden behind a dedup marker.
+  const result = await Promise.race([
+    redis.eval(`
+      if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+      redis.call('RPUSH', KEYS[2], ARGV[1])
+      redis.call('SET', KEYS[1], '1', 'EX', ARGV[2])
+      return 1
+    `, { keys: [dedupKey, CONTACT_MAP_QUEUE], arguments: [raw, String(CONTACT_MAP_DEDUP_SECONDS)] }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("contact_map_enqueue_timeout")), 250))
+  ]);
+  if (Number(result) === 1) console.log("CONTACT MAP QUEUED:", mapping.lid, "->", mapping.phone);
+  return result;
+}
+
 
 function cleanPhone(jid) {
   if (!jid) {
@@ -2880,6 +3046,7 @@ async function start() {
 
   await recoverStuckProcessingJobs();
   await recoverPendingInitialReactions_();
+  await recoverStuckContactMappings_();
 
   app.listen(
     PORT,
@@ -2896,6 +3063,11 @@ async function start() {
 
   sheetRetryDispatcher_().catch((err) => {
     console.error("FATAL SHEET RETRY DISPATCHER ERROR:", err);
+    process.exit(1);
+  });
+
+  contactMapWorker().catch((err) => {
+    console.error("FATAL CONTACT MAP WORKER ERROR:", err);
     process.exit(1);
   });
 
