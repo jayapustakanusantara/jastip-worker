@@ -353,7 +353,10 @@ app.post("/", async (req, res) => {
     const isUpdateEvent =
       normalizedEvent === "messages.update";
 
-    if (!isOrderEvent && !isDeleteEvent && !isUpdateEvent) {
+    const isGroupParticipantsEvent =
+      normalizedEvent === "group.participants.update";
+
+    if (!isOrderEvent && !isDeleteEvent && !isUpdateEvent && !isGroupParticipantsEvent) {
       return res.status(200).json({
         ok: true,
         ignored: true,
@@ -374,6 +377,32 @@ app.post("/", async (req, res) => {
     }
 
     data = data || {};
+
+    // BMA.19.1: Group member add metadata is a separate, non-order path.
+    // It never enters the FIX or reaction queues.
+    if (isGroupParticipantsEvent) {
+      const groupId = String(data.id || data.groupId || "").trim();
+      const action = String(data.action || "").toLowerCase();
+      if (!CONTACT_MAP_GROUPS.has(groupId) || action !== "add") {
+        return res.status(200).json({ ok: true, ignored: true, reason: "group event not monitored/add" });
+      }
+      const members = Array.isArray(data.participantsData) ? data.participantsData :
+        (Array.isArray(data.participants) ? data.participants : []);
+      let queued = 0;
+      for (const member of members) {
+        const mapping = extractGroupParticipantMapping_(member);
+        if (mapping) {
+          queueContactMappingSafely_(mapping).catch((err) => console.error("GROUP CONTACT MAP QUEUE ERROR:", err.message));
+          queued++;
+        }
+      }
+      // Debounced metadata refresh is only a fallback for incomplete add
+      // events. One refresh/group/minute prevents WhatsApp request storms.
+      scheduleLimitedGroupSync_(groupId, String(instance || "Jastip-bot")).catch((err) =>
+        console.error("GROUP CONTACT MAP SYNC ERROR:", err.message)
+      );
+      return res.status(200).json({ ok: true, action: "GROUP_CONTACT_MAP", queued });
+    }
 
     /*
       Evolution/Baileys dapat mengirim key pesan yang dihapus dalam
@@ -2679,6 +2708,72 @@ function extractContactMapping_(candidates, pushName) {
   };
 }
 
+function extractGroupParticipantMapping_(member) {
+  const item = member && typeof member === "object" ? member : { jid: member };
+  const lid = normalizeContactJid_(item.lid || item.jid || item.id);
+  let phone = normalizeContactJid_(item.phoneNumber);
+  // Evolution's enriched group event may expose phoneNumber without the JID
+  // suffix. Accept it only beside a LID and only when it differs from that
+  // LID; the upstream fallback otherwise repeats the LID digits.
+  if (!phone && lid?.kind === "lid") {
+    const digits = String(item.phoneNumber || "").replace(/\D/g, "");
+    if (digits.length >= 7 && digits !== lid.id) phone = { kind: "phone", id: digits, jid: digits + "@s.whatsapp.net" };
+  }
+  if (!lid || lid.kind !== "lid" || !phone || phone.kind !== "phone") return null;
+  return { lid: lid.id, phone: phone.id, lidJid: lid.jid, phoneJid: phone.jid,
+    pushName: cleanPushName_(item.name || item.notify || ""), observedAt: new Date().toISOString() };
+}
+
+async function scheduleLimitedGroupSync_(groupId, instance) {
+  const debounceKey = "jastip:contact-map:group-debounce:" + groupId;
+  const first = await redis.set(debounceKey, "1", { NX: true, EX: 30 });
+  if (!first) return;
+  setTimeout(() => refreshGroupContactMappings_(groupId, instance).catch((err) =>
+    console.error("GROUP CONTACT MAP REFRESH ERROR:", groupId, err.message)
+  ), 30_000).unref();
+}
+
+async function refreshGroupContactMappings_(groupId, instance) {
+  const throttleKey = "jastip:contact-map:group-refresh:" + groupId;
+  const allowed = await redis.set(throttleKey, "1", { NX: true, EX: 60 });
+  if (!allowed || !EVOLUTION_API_URL || !EVOLUTION_API_KEY) return;
+  const endpoint = String(EVOLUTION_API_URL).replace(/\/+$/, "") +
+    "/group/participants/" + encodeURIComponent(instance) +
+    "?groupJid=" + encodeURIComponent(groupId);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+  try {
+    const response = await fetch(endpoint, { headers: { apikey: EVOLUTION_API_KEY }, signal: controller.signal });
+    if (!response.ok) throw new Error("group_participants_http_" + response.status);
+    const payload = await response.json();
+    const members = Array.isArray(payload?.participants) ? payload.participants : [];
+    for (const member of members) {
+      const mapping = extractGroupParticipantMapping_(member);
+      if (mapping) queueContactMappingSafely_(mapping).catch((err) => console.error("GROUP SYNC MAP QUEUE ERROR:", err.message));
+    }
+    console.log("GROUP CONTACT MAP REFRESH:", groupId, "| members", members.length);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function ensureGroupParticipantWebhook_(instance) {
+  if (!EVOLUTION_API_URL || !EVOLUTION_API_KEY) return;
+  const base = String(EVOLUTION_API_URL).replace(/\/+$/, "");
+  const headers = { apikey: EVOLUTION_API_KEY, "content-type": "application/json" };
+  const current = await fetch(base + "/webhook/find/" + encodeURIComponent(instance), { headers });
+  if (!current.ok) throw new Error("webhook_find_http_" + current.status);
+  const webhook = await current.json();
+  const events = Array.isArray(webhook?.events) ? webhook.events.map(String) : [];
+  if (!webhook?.enabled || events.includes("GROUP_PARTICIPANTS_UPDATE")) return;
+  const response = await fetch(base + "/webhook/set/" + encodeURIComponent(instance), {
+    method: "POST", headers,
+    body: JSON.stringify({ webhook: { ...webhook, events: [...events, "GROUP_PARTICIPANTS_UPDATE"] } })
+  });
+  if (!response.ok) throw new Error("webhook_set_http_" + response.status);
+  console.log("GROUP_PARTICIPANTS_UPDATE ENABLED");
+}
+
 function cleanPushName_(value) {
   const name = String(value || "").trim();
   return !name || /@lid$/i.test(name) || /^\d+$/.test(name) ? "" : name.slice(0, 120);
@@ -3048,6 +3143,17 @@ async function start() {
   await recoverStuckProcessingJobs();
   await recoverPendingInitialReactions_();
   await recoverStuckContactMappings_();
+  ensureGroupParticipantWebhook_(TRACE_REPLY_INSTANCE)
+    .catch((err) => console.error("GROUP PARTICIPANT WEBHOOK CONFIG ERROR:", err.message));
+
+  // Initial member sync runs once per group every 30 days, never on every
+  // reconnect or process restart.
+  for (const groupId of CONTACT_MAP_GROUPS) {
+    const key = "jastip:contact-map:initial-sync:v1:" + groupId;
+    const first = await redis.set(key, "1", { NX: true, EX: 60 * 60 * 24 * 30 });
+    if (first) refreshGroupContactMappings_(groupId, TRACE_REPLY_INSTANCE)
+      .catch((err) => console.error("INITIAL GROUP CONTACT MAP ERROR:", groupId, err.message));
+  }
 
   app.listen(
     PORT,
